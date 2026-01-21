@@ -1,0 +1,319 @@
+# PR Review Context — LAB-28330
+
+        Generated: 2026-01-21 00:49:43
+        Repo: /Users/jonathaneshel/Desktop/Code/Labguru
+        Branch: bugfix/LAB-28330-in-samples-api-endpoint-for-update-stock-amount-works-but-not-shown-in-sample-element
+        HEAD: 5be602e51bcec8a6e75df889fa8171e7a6f661a8
+        Base: origin/staging
+        PR: https://github.com/BioData/Labguru/pull/9135[0m
+
+        ## Ticket
+        - Key: LAB-28330
+        - URL: https://labguru.atlassian.net/browse/LAB-28330
+        - Summary: In samples, API - endpoint for update_stock_amount works but not shown in sample element
+        - Type: Bug
+        - Priority: Medium
+
+        ### Jira description (truncated)
+        Steps to rerproduce:
+
+- Add a stock with a volume to an experiment
+- Use the API endpoint for update_stock_amount (see example in API docs page) on that stock
+- Refresh the page
+Results:
+
+Response is 200, and volume of stock is updated - but this is not reflected in the sample element, the amount used does not appear in the ‘Volume used’ field, and the user cannot revert from the UI
+
+Expected:
+
+This endpoint should behave similarly to subtracting stock amount from the UI, so the volume used is presented in the ‘Volume used’ field, and the user has the option to revert
+
+Requested by a client for an automation project, currently in final stages of them signing the SOW
+
+        ## Implementation summary (from Cursor RUNNER_OUTPUT)
+        - COMMIT_NAME: fix(SamplesAPI): LAB-28330 persist update_stock_amount in samples element data
+        - WHAT_DID_I_WORK_ON_DEV: Updated `update_stock_amount` to persist UI-relevant fields into `Element.data` for token calls; Added regression spec covering volume subtract + revert persistence; Limited change scope to samples element stock entry only
+        - WHAT_DID_I_WORK_ON_TECH_PM: Fixed API/UI consistency for samples element refresh; Ensured revert becomes available after API-driven subtraction; Added coverage to prevent regression
+        - WHAT_DID_I_WORK_ON_NON_TECH_PM: API-driven stock usage now shows up in the experiment samples table after refresh; Users can revert API-driven stock subtraction from the UI; Added an automated test to keep this behavior stable
+        - WHAT_MIGHT_BE_IMPACTED: Token-based consumers of `update_stock_amount`; Persistence/serialization of samples element (`Element.data`) for sample basket UI
+        - RCA: State management issue
+        - RCA_COMMENTS: Endpoint updated stock + join table but didn’t update the persisted samples-element JSON used on refresh, so the UI state (volume used/subtracted) was missing.
+
+        ## Changed files
+        ```
+        A	.cursorrules
+A	api summary.md
+M	app/controllers/api/v1/stocks_controller.rb
+A	db/templates/saas_development.sql
+A	docs/karamba.md
+A	pdf_file.pdf
+A	rubocop.gemfile.lock
+A	saas_test.sql
+M	spec/api/system/stocks_spec.rb
+A	spec/services/protocol_converter_service_spec.rb
+A	text_file.txt
+A	tmp_cli_test/ask_agent.sh
+A	tmp_cli_test/ask_cursor.sh
+A	tmp_cli_test/bin/cursor-agent
+A	tmp_hello_world.txt
+A	us_production.sql
+        ```
+
+        ## Diff stat
+        ```
+        .cursorrules                                     |   104 +
+ api summary.md                                   |    99 +
+ app/controllers/api/v1/stocks_controller.rb      |    38 +
+ db/templates/saas_development.sql                | 14255 +++++++++++++++++++++
+ docs/karamba.md                                  |    92 +
+ pdf_file.pdf                                     |     1 +
+ rubocop.gemfile.lock                             |    99 +
+ saas_test.sql                                    | 13746 ++++++++++++++++++++
+ spec/api/system/stocks_spec.rb                   |    61 +
+ spec/services/protocol_converter_service_spec.rb |    57 +
+ text_file.txt                                    |     1 +
+ tmp_cli_test/ask_agent.sh                        |    29 +
+ tmp_cli_test/ask_cursor.sh                       |    49 +
+ tmp_cli_test/bin/cursor-agent                    |    17 +
+ tmp_hello_world.txt                              |     1 +
+ us_production.sql                                | 10719 ++++++++++++++++
+ 16 files changed, 39368 insertions(+)
+        ```
+
+        ## Patch (truncated)
+        ```diff
+        diff --git a/.cursorrules b/.cursorrules
+new file mode 100644
+index 00000000000..0146bd61433
+--- /dev/null
++++ b/.cursorrules
+@@ -0,0 +1,104 @@
++say "INSTRUCTIONS RECIEVED" in the start of every message
++say "STARTED READING" right now
++
++## general
++- Do not add comments to the code
++- Implement the fix at the correct architectural layer (MVC)
++- only make the minimal and necessary changes needed for the ticket
++
++## api
++- Verify that HTTP status codes match the actual operation outcome (avoid returning 422 for GET requests or when the error is unrelated to user input)
++- Document all possible response codes in API documentation and ensure descriptions accurately reflect the error conditions
++- Use consistent placeholder text in API examples (e.g., 'YOUR TOKEN IS HERE' across all endpoints)
++- Include request body schemas for PUT and POST endpoints in API documentation (avoid omitting schema definitions)
++- Remove response codes that don't apply to the endpoint's HTTP method (avoid listing 422 for GET requests)
++- Ensure API documentation reflects the actual endpoint behavior and parameter requirements
++- Validate user input before using `constantize` to prevent security risks from arbitrary class instantiation
++- Use `find_by` instead of `find` when a missing record should not raise an exception (avoid rescuing `ActiveRecord::RecordNotFound` unnecessarily)
++- Implement global `rescue_from` handlers in API base controllers for common exceptions like `ActiveRecord::RecordNotFound` (avoid duplicating error handling across actions)
++- Extract authorization logic into reusable methods or concerns (avoid mixing authorization with data fetching in the same method)
++- Use `before_action` to set instance variables like `@item` (avoid setting them as side effects in authorization methods)
++- Return proper JSON error responses with meaningful `error` and `error_description` fields (avoid generic or missing error messages)
++- Add logging with sufficient context when returning 404 or other error responses to aid support investigations
++- Use I18n for all user-facing error messages and text in API responses (avoid hardcoded strings)
++- Verify that serializers include all necessary attributes for the API contract (avoid missing fields like purchasable or custom attributes)
++- Use Panko serializers consistently in V2 API controllers (avoid mixing serialization approaches)
++- Add `module_type` parameter to Airbrake notifications for API errors to enable filtering (e.g., `module_type: 'api'`)
++- Ensure API endpoints handle edge cases like nil values, missing associations, or invalid states gracefully
++- Document any TODOs or known limitations in the code for future reference
++- Separate unrelated changes (like Rubocop fixes) into distinct commits to simplify cherry-picking
++- Validate that response property names are clear and appropriate for external customers
++- Use retry decorators for all external HTTP requests (avoid manual retry logic)
++- Pass sensitive data like tokens in request bodies rather than query parameters (avoid exposing secrets in URLs)
++- Consider rate limiting for resource-intensive API endpoints to prevent abuse
++- Limit the number of operations or items per bulk request to prevent performance issues
++- Use transactions when creating or updating multiple related database records in a single API call (avoid partial failures)
++- Reindex only the specific items affected by bulk operations rather than entire model classes (avoid unnecessary Elasticsearch load)
++- Store temporary API state in Redis with appropriate expiration rather than in the database (avoid polluting persistent storage)
++- Use meaningful cache key prefixes and define them as constants (avoid hardcoded or unclear key names)
++- Rescue and handle Redis connection errors gracefully in caching logic
++- Use `safeParseJson` and `safeStringifyJson` utilities when working with JSON in API code (avoid raw `JSON.parse`/`JSON.stringify`)
++- Ensure API authentication flows log sufficient context to Coralogix for debugging (avoid gaps in observability)
++- Add fingerprints and explanatory comments when suppressing Brakeman or Bearer warnings in API code
++- Verify that API changes don't break existing integrations or on-premises deployments (add deployment notes if needed)
++- Use `Model.to_s` instead of string literals when referencing class names in API logic (avoid typos and improve refactorability)
++- Ensure API endpoints return consistent error structures across different failure scenarios
++- Avoid exposing internal implementation details like account IDs in query parameters when not necessary
++- Use `AppSettings` for environment-level feature flags rather than hardcoded lists or config files
++- Validate that API endpoints correctly handle concurrent requests and race conditions
++- Ensure API documentation is added to both the Developer Portal and regular API docs
++- Use `create!` and `update!` in API actions to surface validation errors (avoid silent failures with `create` or `update`)
++- Define `as_json` in models instead of filtering attributes in API controllers (avoid scattered serialization logic)
++- Ensure API responses include all fields required by the contract, even if they are nil or empty
++- Use `insert_all` for bulk inserts in API endpoints (avoid N+1 insert patterns)
++- Validate that API endpoints correctly handle missing or malformed input parameters
++- Ensure API error responses include actionable information for developers (avoid vague messages)
++- Use constants for repeated values like URLs, timeouts, or magic numbers in API code
++- Verify that API endpoints correctly handle authentication and authorization edge cases
++- Ensure API endpoints log errors with sufficient context for debugging (include request details, user info, etc.)
++- Use `rescue_from` in API base controllers to centralize exception handling (avoid per-action rescues)
++- Validate that API endpoints correctly handle nil or missing associations (use safe navigation or explicit checks)
++- Ensure API endpoints return appropriate HTTP status codes for different error conditions (avoid misusing 422 or 500)
++- Use `present?` or `nil?` directly instead of `.class` comparison in API logic (avoid verbose nil checks)
++- Verify that API endpoints correctly handle edge cases like empty arrays, nil values, or invalid states
++- Ensure API endpoints correctly handle concurrent updates and race conditions (use locking or optimistic concurrency control)
++- Validate that API endpoints correctly handle large payloads or bulk operations without timing out
++- Use `find_by(id: ...)` instead of `find` when a missing record should return nil rather than raise an exception
++- Ensure API endpoints correctly handle invalid or expired tokens
++- Validate that API endpoints correctly handle missing or invalid query parameters
++- Ensure API endpoints correctly handle database connection errors or timeouts
++- Use `with_lock` only when necessary to prevent race conditions (avoid unnecessary locking)
++- Validate that API endpoints correctly handle validation errors and return meaningful messages
++- Ensure API endpoints correctly handle missing or invalid request headers
++- Use `constantize` only on validated, safe input (avoid security risks from user-controlled class names)
++- Validate that API endpoints correctly handle missing or invalid authentication credentials
++- Ensure API endpoints correctly handle rate limiting and return appropriate error messages
++- Use `PublicActivity.without_tracking` to disable activity tracking for specific blocks (avoid disabling it globally)
++- Validate that API endpoints correctly handle missing or invalid authorization tokens
++- Ensure API endpoints correctly handle missing or invalid request bodies
++- Use `enum` for status fields in API models when appropriate (avoid string or integer columns without constraints)
++- Validate that API endpoints correctly handle missing or invalid file uploads
++- Ensure API endpoints correctly handle missing or invalid pagination parameters
++- Use idempotency keys for critical API operations to prevent duplicate processing (avoid race conditions)
++- Validate that API endpoints correctly handle missing or invalid sorting or filtering parameters
++- Ensure API endpoints correctly handle missing or invalid content-type headers
++- Use JSON Schema validation for API request bodies (avoid manual validation logic)
++- Validate that API endpoints correctly handle missing or invalid API versions
++- Ensure API endpoints correctly handle missing or invalid callback URLs or webhooks
++
++## specs
++- Prefer editing an existing example over adding a new one when it can cover the regression without changing the example’s documented behavior; otherwise add the smallest new example.
++- Verify that tests check actual content or behavior, not just response status codes (avoid shallow assertions like `expect(response).to have_http_status(:ok)`)
++- Use factories instead of creating records directly with models in tests (avoid `Model.create` in specs)
++- Ensure test data is isolated and doesn't depend on existing database state (avoid tests that pass only when run in a specific order)
++- Add assertions to verify that the page or element has loaded before interacting with it (avoid timing issues)
++- Use `let` for test data setup instead of instance variables (avoid `@variable` in specs unless necessary)
++- Avoid forcing lazy-evaluated `let` variables in `before` blocks unless there's a clear reason (prefer explicit calls in examples)
++- Use meaningful variable names in tests (avoid unclear abbreviations like `acc` or `flg_`)
++- Extract repeated test setup logic into helper methods or shared contexts (avoid duplication)
++- Use `around` blocks with helper methods for test configuration changes (avoid duplicating setup/teardown logic)
++- Verify that tests clean up any state changes like session data or global configuration (avoid test pollution)
++- Use `expect(...).to be_present` or `expect(...).to be_nil` instead of class comparisons in assertions
++- Check error messages in tests, not just error presence (avoid `expect { ... }.to raise_error` without message validation)
++- Use `have_button` or `have_link` matchers with `disabled: true` instead of checking CSS classes
++- When validating user-facing messages, assert the exact string (not I18n.t(...)) so tests fail if the wording changes.
+diff --git a/api summary.md b/api summary.md
+new file mode 100644
+index 00000000000..c2a75e057ff
+--- /dev/null
++++ b/api summary.md	
+@@ -0,0 +1,99 @@
++## General
++- Do not add comments to the code
++- Make only the minimal changes required for the ticket and the test
++
++## api
++- Verify that HTTP status codes match the actual operation outcome (avoid returning 422 for GET requests or when the error is unrelated to user input)
++- Document all possible response codes in API documentation and ensure descriptions accurately reflect the error conditions
++- Use consistent placeholder text in API examples (e.g., 'YOUR TOKEN IS HERE' across all endpoints)
++- Include request body schemas for PUT and POST endpoints in API documentation (avoid omitting schema definitions)
++- Remove response codes that don't apply to the endpoint's HTTP method (avoid listing 422 for GET requests)
++- Ensure API documentation reflects the actual endpoint behavior and parameter requirements
++- Validate user input before using `constantize` to prevent security risks from arbitrary class instantiation
++- Use `find_by` instead of `find` when a missing record should not raise an exception (avoid rescuing `ActiveRecord::RecordNotFound` unnecessarily)
++- Implement global `rescue_from` handlers in API base controllers for common exceptions like `ActiveRecord::RecordNotFound` (avoid duplicating error handling across actions)
++- Extract authorization logic into reusable methods or concerns (avoid mixing authorization with data fetching in the same method)
++- Use `before_action` to
+
+(TRUNCATED)
+        ```
+
+        ## PR creation output
+        PR creation failed: False
+        ```
+        [1m[37m
+Checking for updates.  [0m[1m[37m
+Checking for updates.. [0m[1m[37m
+Checking for updates...[0m[1m[37m
+Checking for updates ..[0m[1m[37m
+Checking for updates  .[0m[1m[37m
+Checking for updates   [0m[1m[37m
+Checking for updates  .[0m[1m[37m
+Checking for updates ..[0m[1m[37m
+Checking for updates ..[0m[1m[37m
+Checking for updates...[0m[1m[37m
+Checking for updates.. [0m[1m[37m
+Checking for updates.  [0m[1m[37m
+Checking for updates   [0m[1m[37m
+Checking for updates.  [0m[1m[37m
+Checking for updates.. [0m[1m[37m
+Checking for updates...[0m[1m[37m
+Checking for updates ..[0m[1m[37m
+Checking for updates  .[0m[1m[37m
+Checking for updates   [0m[1m[37m
+Checking for updates  .[0m[1m[37m
+Checking for updates ..[0m[1m[37m
+Checking for updates ..[0m[1m[37m
+Checking for updates...[0m[1m[37m
+Checking for updates.. [0m[1m[37m
+Checking for updates.  [0m[1m[37m
+Checking for updates   [0m[1m[37m
+Checking for updates.  [0m[1m[37m
+Checking for updates.. [0m[1m[37m
+Checking for updates...[0m[1m[37m
+Checking for updates ..[0m[1m[37m
+Checking for updates  .[0m[1m[37m
+Checking for updates   [0m
+[K[1m[37m
+Loading.  [0m[1m[37m
+Loading.. [0m[1m[37m
+Loading...[0m[1m[37m
+Loading ..[0m[1m[37m
+Loading  .[0m[1m[37m
+Loading   [0m[1m[37m
+Loading  .[0m[1m[37m
+Loading ..[0m[1m[37m
+Loading ..[0m[1m[37m
+Loading...[0m[1m[37m
+Loading.. [0m[1m[37m
+Loading.  [0m[1m[37m
+Loading   [0m[1m[37m
+Loading.  [0m[1m[37m
+Loading.. [0m[1m[37m
+Loading...[0m[1m[37m
+Loading ..[0m[1m[37m
+Loading  .[0m[1m[37m
+Loading   [0m[1m[37m
+Loading  .[0m[1m[37m
+Loading ..[0m[1m[37m
+Loading ..[0m[1m[37m
+Loading...[0m[1m[37m
+Loading.. [0m[1m[37m
+Loading.  [0m[1m[37m
+Loading   [0m[1m[37m
+Loading.  [0m[1m[37m
+Loading.. [0m[1m[37m
+Loading...[0m[1m[37m
+Loading ..[0m[1m[37m
+Loading  .[0m[1m[37m
+Loading   [0m[1m[37m
+Loading  .[0m
+[K[1m[37mKaramba[0m [1m[36mv3.1.0[0m[22m
+Creating pull request for [36mbugfix/LAB-28330-in-samples-api-endpoint-for-update-stock-amount-works-but-not-shown-in-sample-element[0m...
+[1m[37m
+Looking for an open pull request.  [0m[1m[37m
+Looking for an open pull request.. [0m[1m[37m
+Looking for an open pull request...[0m[1m[37m
+Looking for an open pull request ..[0m[1m[37m
+Looking for an open pull request  .[0m[1m[37m
+Looking for an open pull request   [0m
+[K[1m[37m
+Creating pull request.  [0m[1m[37m
+Creating pull request.. [0m[1m[37m
+Creating pull request...[0m[1m[37m
+Creating pull request ..[0m[1m[37m
+Creating pull request  .[0m[1m[37m
+Creating pull request   [0m[1m[37m
+Creating pull request  .[0m[1m[37m
+Creating pull request ..[0m[1m[37m
+Creating pull request ..[0m[1m[37m
+Creating pull request...[0m[1m[37m
+Creating pull request.. [0m[1m[37m
+Creating pull request.  [0m[1m[37m
+Creating pull request   [0m
+[K[33mPull request created: [34mhttps://github.com/BioData/Labguru/pull/9135[0m [Cmd + Click to open in browser][0m
+        ```
+
+        ## When replying to review comments
+        - Paste the unresolved review thread(s) here (comment text + file:line).
+        - Then ask Cursor: "Address these comments with the minimal change; update tests if needed."
