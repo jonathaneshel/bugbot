@@ -49,6 +49,9 @@ API_RULES_MD_PATH = os.path.join(BUGBOT_FILES_DIR, "api summary.md")
 BUGBOT_TEACHER_CURSORRULES_PATH = (
     "/Users/jonathaneshel/Desktop/Code/DS/app/services/protocol_converter/.cursorrules"
 )
+JIRA_INSTRUCTIONS_PATH = os.path.join(BUGBOT_FILES_DIR, "JIRA_INSTRUCTIONS")
+_JIRA_FIELDS_JSON_BEGIN = "[JIRA_FIELDS_JSON]"
+_JIRA_FIELDS_JSON_END = "[/JIRA_FIELDS_JSON]"
 
 REVIEW_CONTEXT_DIR = os.path.join(BUGBOT_FILES_DIR, "review_context")
 MAX_REVIEW_CONTEXT_DESCRIPTION_CHARS = 8000
@@ -74,6 +77,8 @@ class RunnerOutput:
     what_might_be_impacted: str
     rca: str
     rca_comments: str
+    specs_status: str
+    specs_details: str
 
 
 class PrCreationError(RuntimeError):
@@ -125,6 +130,45 @@ def _read_text(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         return f.read().strip()
 
+
+def _read_text_if_exists(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def _parse_jira_instructions(raw: str) -> tuple[str, dict[str, Any]]:
+    """
+    Returns (prompt_instructions_text, config_dict).
+    Config is optional; if absent/invalid, returns {}.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return "", {}
+
+    m = re.search(
+        re.escape(_JIRA_FIELDS_JSON_BEGIN) + r"([\s\S]*?)" + re.escape(_JIRA_FIELDS_JSON_END),
+        text,
+    )
+    if not m:
+        return text, {}
+
+    json_block = (m.group(1) or "").strip()
+    prompt_text = (text[: m.start()] + "\n" + text[m.end() :]).strip()
+
+    if not json_block:
+        return prompt_text, {}
+
+    try:
+        cfg = json.loads(json_block)
+        if isinstance(cfg, dict):
+            return prompt_text, cfg
+    except Exception:
+        pass
+
+    return prompt_text, {}
 
 def _truncate(s: str, max_chars: int) -> str:
     s = (s or "").strip()
@@ -370,6 +414,78 @@ def _jira_basic_auth_header(email: str, api_token: str) -> str:
     return f"Basic {b64}"
 
 
+def _runner_output_value(ro: RunnerOutput, key: str) -> str:
+    table = {
+        "WHAT_DID_I_WORK_ON_DEV": ro.what_did_i_work_on_dev,
+        "WHAT_DID_I_WORK_ON_TECH_PM": ro.what_did_i_work_on_tech_pm,
+        "WHAT_DID_I_WORK_ON_NON_TECH_PM": ro.what_did_i_work_on_non_tech_pm,
+        "WHAT_MIGHT_BE_IMPACTED": ro.what_might_be_impacted,
+        "RCA": ro.rca,
+        "RCA_COMMENTS": ro.rca_comments,
+        "COMMIT_NAME": ro.commit_name,
+    }
+    if key not in table:
+        raise RuntimeError(f"Unknown runner output key in JIRA_INSTRUCTIONS config: {key}")
+    return table[key] or ""
+
+
+def _format_for_jira(value: str, fmt: str, *, append_value: str = "") -> Any:
+    """
+    Returns a value suitable for Jira 'fields' payload.
+    We keep it simple: send plain strings. (If your Jira fields require ADF, we can extend this.)
+    """
+    v = (value or "").strip()
+    a = (append_value or "").strip()
+    fmt = (fmt or "as_is").strip()
+
+    if fmt == "bullets":
+        # Input is usually "a; b; c" → "- a\n- b\n- c"
+        parts = [p.strip() for p in v.split(";") if p.strip()]
+        v = "\n".join([f"- {p}" for p in parts]) if parts else v
+
+    if fmt == "rca_with_comments":
+        if a:
+            return f"{v}\n\n{a}".strip()
+        return v
+
+    # default: as-is (optionally append)
+    return (v + ("\n" + a if a else "")).strip()
+
+
+def update_jira_issue_fields(
+    *,
+    jira_base_url: str,
+    issue_key: str,
+    email: str,
+    api_token: str,
+    fields_payload: dict[str, Any],
+) -> None:
+    api_url = f"{jira_base_url.rstrip('/')}/rest/api/3/issue/{issue_key}"
+    body = json.dumps({"fields": fields_payload}).encode("utf-8")
+
+    req = urllib.request.Request(
+        api_url,
+        data=body,
+        method="PUT",
+        headers={
+            "Authorization": _jira_basic_auth_header(email, api_token),
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            _ = resp.read()
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise RuntimeError(f"Jira update failed ({e.code}) for {api_url}. Details: {detail}") from e
+
+
 def _http_get_json(url: str, headers: dict[str, str]) -> Any:
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -440,6 +556,8 @@ def build_cursor_prompt(issue: JiraIssue) -> str:
     plan_md = _read_text(PLAN_MD_PATH)
     api_rules = _read_text(API_RULES_MD_PATH)
     bugbot_rules = _read_text(BUGBOT_TEACHER_CURSORRULES_PATH)
+    jira_instructions_raw = _read_text_if_exists(JIRA_INSTRUCTIONS_PATH)
+    jira_prompt_instructions, _jira_cfg = _parse_jira_instructions(jira_instructions_raw)
 
     description = issue.description_text
     if not description:
@@ -457,6 +575,11 @@ def build_cursor_prompt(issue: JiraIssue) -> str:
         Summary: {issue.summary}
         Type: {issue.issue_type}
         Priority: {issue.priority}
+
+        {"Jira field-filling instructions (follow these when writing RUNNER_OUTPUT fields):" if jira_prompt_instructions else ""}
+        {"--- BEGIN JIRA_INSTRUCTIONS ---" if jira_prompt_instructions else ""}
+        {jira_prompt_instructions if jira_prompt_instructions else ""}
+        {"--- END JIRA_INSTRUCTIONS ---" if jira_prompt_instructions else ""}
 
         You MUST fix this ticket according to @bugbot files/PLAN.md.
         (For convenience, the full contents of that file are included below as PLAN.md.)
@@ -496,6 +619,8 @@ def build_cursor_prompt(issue: JiraIssue) -> str:
           WHAT_MIGHT_BE_IMPACTED: <1 or 2 big-picture impacts, in a single line, separated by "; ">
           RCA: <must be EXACTLY one of the allowed values below>
           RCA_COMMENTS: <required line; if none, leave empty after the colon>
+          SPECS_STATUS: <must be EXACTLY one of: OK; FAILED; NOT_RUN>
+          SPECS_DETAILS: <required line; include the spec command(s) you ran; if FAILED include brief failure; if NOT_RUN include why>
           RUNNER_OUTPUT_END
 
         - Allowed RCA values (pick exactly one, copy/paste exactly):
@@ -1162,6 +1287,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Timeout for cursor-agent in headless mode (seconds).",
     )
     parser.add_argument(
+        "--no-jira-field-update",
+        action="store_true",
+        help="Disable updating Jira fields from JIRA_INSTRUCTIONS (even if configured).",
+    )
+    parser.add_argument(
         "--non-interactive",
         action="store_true",
         help="Run cursor-agent headlessly (no stdin forwarding for clarifying questions).",
@@ -1230,6 +1360,40 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"WHAT_MIGHT_BE_IMPACTED: {runner_output.what_might_be_impacted}")
     print(f"RCA: {runner_output.rca}")
     print(f"RCA_COMMENTS: {runner_output.rca_comments}")
+
+    if not args.no_jira_field_update:
+        jira_instructions_raw = _read_text_if_exists(JIRA_INSTRUCTIONS_PATH)
+        _jira_prompt_instructions, jira_cfg = _parse_jira_instructions(jira_instructions_raw)
+        if jira_cfg.get("enabled") and jira_cfg.get("updates"):
+            updates = jira_cfg["updates"]
+            if not isinstance(updates, list):
+                raise RuntimeError("JIRA_INSTRUCTIONS config: 'updates' must be a list")
+
+            fields_payload: dict[str, Any] = {}
+            for u in updates:
+                if not isinstance(u, dict):
+                    raise RuntimeError("JIRA_INSTRUCTIONS config: each update must be an object")
+                field_id = (u.get("jira_field_id") or "").strip()
+                source = (u.get("source") or "").strip()
+                fmt = (u.get("format") or "as_is").strip()
+                append_source = (u.get("append_source") or "").strip()
+
+                if not field_id or not source:
+                    raise RuntimeError("JIRA_INSTRUCTIONS config: update requires jira_field_id and source")
+
+                value = _runner_output_value(runner_output, source)
+                append_value = _runner_output_value(runner_output, append_source) if append_source else ""
+                fields_payload[field_id] = _format_for_jira(value, fmt, append_value=append_value)
+
+            _log(f"Updating Jira fields for {issue_key} based on JIRA_INSTRUCTIONS ...")
+            update_jira_issue_fields(
+                jira_base_url=args.jira_base_url,
+                issue_key=issue_key,
+                email=jira_email,
+                api_token=jira_token,
+                fields_payload=fields_payload,
+            )
+            _log("Jira fields updated.")
 
     pr_url: Optional[str] = None
     pr_create_output: str = ""

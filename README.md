@@ -41,6 +41,40 @@ Force headless mode:
 python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/ticket_runner.py" 1234 --non-interactive
 ```
 
+## Jira autofill from RUNNER_OUTPUT (optional)
+
+If you create a file at:
+
+- `/Users/jonathaneshel/Desktop/Code/bugbot files/JIRA_INSTRUCTIONS`
+
+...the runner will:
+
+- Include its contents as guidance to Cursor when producing the `RUNNER_OUTPUT` block
+- Optionally update Jira fields using Jira REST (if you include an enabled JSON config block)
+
+Recommended format:
+
+```text
+Plain-English writing instructions for the three Jira fields go here.
+
+[JIRA_FIELDS_JSON]
+{
+  "enabled": true,
+  "updates": [
+    { "jira_field_id": "customfield_12345", "source": "WHAT_DID_I_WORK_ON_DEV", "format": "bullets" },
+    { "jira_field_id": "customfield_23456", "source": "RCA", "append_source": "RCA_COMMENTS", "format": "rca_with_comments" },
+    { "jira_field_id": "customfield_34567", "source": "WHAT_MIGHT_BE_IMPACTED", "format": "bullets" }
+  ]
+}
+[/JIRA_FIELDS_JSON]
+```
+
+To disable Jira field updates for a run:
+
+```bash
+python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/ticket_runner.py" 1234 --no-jira-field-update
+```
+
 ## Cursor plan mode
 
 This script always runs `cursor-agent` and enters plan mode by prefixing the prompt with `/plan`.
@@ -94,5 +128,66 @@ python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/ticket_runner.py" 1234 -
 - Process: `PLAN.md` (in this folder)
 - Extra API guidance: `api summary.md` (in this folder)
 - Bugbot teacher rules: `/Users/jonathaneshel/Desktop/Code/DS/app/services/protocol_converter/.cursorrules`
+
+## Slackbot (Socket Mode) — answer questions from `review_context/`
+
+This folder also includes `slackbot.py`, a Socket Mode Slack bot that listens for `@mention`s like:
+
+`@bugbot LAB-28330 what changed and what might be impacted?`
+
+It will:
+
+- Find the matching markdown file in `review_context/`
+- Build a bounded prompt (drops the giant `## Patch` section)
+- Run `cursor-agent` non-interactively to answer
+- Reply in the same Slack thread (chunked if long)
+
+### Slack app configuration
+
+In your Slack app:
+
+- Enable **Socket Mode**
+  - Create an **App-Level Token** with scope `connections:write`
+  - Save it as `SLACK_APP_TOKEN` (starts with `xapp-`)
+- Enable **Event Subscriptions**
+  - Subscribe to the bot event: `app_mention`
+- OAuth scopes (Bot Token Scopes)
+  - `app_mentions:read`
+  - `chat:write`
+- Install the app to your workspace (gives `SLACK_BOT_TOKEN`, starts with `xoxb-`)
+- Invite the app to the channel(s) where you want it to respond: `/invite @YourAppName`
+
+### Requirements
+
+- Python 3
+- `cursor-agent` on your PATH
+- Python dependency:
+
+```bash
+python3 -m pip install slack-bolt
+```
+
+### Run
+
+```bash
+export SLACK_BOT_TOKEN="xoxb-..."
+export SLACK_APP_TOKEN="xapp-..."
+
+# Optional:
+export CURSOR_MODEL="gpt-5"
+export CURSOR_TIMEOUT_SECONDS="90"
+
+python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/slackbot.py"
+```
+
+### Optional environment variables
+
+- `REVIEW_CONTEXT_DIR`: defaults to `/Users/jonathaneshel/Desktop/Code/bugbot files/review_context`
+- `PROJECT_PREFIX`: defaults to `LAB`
+- `CURSOR_BIN`: defaults to `cursor-agent`
+- `CURSOR_MODEL`: defaults to `gpt-5`
+- `CURSOR_TIMEOUT_SECONDS`: defaults to `90`
+- `SLACK_MAX_CHARS`: defaults to `3500`
+- `SLACKBOT_WORKERS`: defaults to `4`
 
 
