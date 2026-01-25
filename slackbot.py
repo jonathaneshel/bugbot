@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import logging
+import json
 import os
 import re
 import subprocess
+import tempfile
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
@@ -19,11 +24,15 @@ REVIEW_CONTEXT_DIR = os.getenv("REVIEW_CONTEXT_DIR", DEFAULT_REVIEW_CONTEXT_DIR)
 PROJECT_PREFIX = (os.getenv("PROJECT_PREFIX", "LAB") or "LAB").strip().upper()
 
 CURSOR_BIN = os.getenv("CURSOR_BIN", "cursor-agent")
-CURSOR_MODEL = os.getenv("CURSOR_MODEL", "gpt-5")
+CURSOR_MODEL = os.getenv("CURSOR_MODEL", "gpt-5.2-high")
 CURSOR_TIMEOUT_SECONDS = float(os.getenv("CURSOR_TIMEOUT_SECONDS", "90"))
 
 SLACK_MAX_CHARS = int(os.getenv("SLACK_MAX_CHARS", "3500"))
 WORKERS = int(os.getenv("SLACKBOT_WORKERS", "4"))
+
+DEFAULT_SESSIONS_PATH = os.path.join(BUGBOT_FILES_DIR, ".slackbot_sessions.json")
+SESSIONS_PATH = os.getenv("SLACKBOT_SESSIONS_PATH", DEFAULT_SESSIONS_PATH)
+MAX_TURNS = int(os.getenv("SLACKBOT_MAX_TURNS", "50"))
 
 DROP_EXACT_LINES = {"INSTRUCTIONS RECIEVED", "STARTED READING"}
 
@@ -34,6 +43,105 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=WORKERS)
 class ParsedRequest:
     ticket_key: str
     question: str
+
+
+@dataclass
+class Session:
+    ticket_key: Optional[str]
+    history: list[dict[str, str]]  # [{"role": "user"|"assistant", "text": "..."}]
+    updated_at_ms: int
+
+
+class SessionStore:
+    def __init__(self, *, path: str, max_turns: int) -> None:
+        self._path = os.path.abspath(os.path.expanduser(path))
+        self._max_turns = max(1, int(max_turns))
+        self._lock = threading.Lock()
+        self._loaded = False
+        self._data: dict[str, Session] = {}
+
+    def _load_locked(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            with open(self._path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception:
+            return
+
+        sessions = raw.get("sessions") if isinstance(raw, dict) else None
+        if not isinstance(sessions, dict):
+            return
+
+        for key, val in sessions.items():
+            if not isinstance(key, str) or not isinstance(val, dict):
+                continue
+            ticket_key = val.get("ticket_key")
+            if not isinstance(ticket_key, str) or not ticket_key.strip():
+                ticket_key = None
+            history = val.get("history")
+            if not isinstance(history, list):
+                history = []
+            cleaned_history: list[dict[str, str]] = []
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                role = item.get("role")
+                text = item.get("text")
+                if role not in ("user", "assistant"):
+                    continue
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                cleaned_history.append({"role": role, "text": text.strip()})
+            updated_at_ms = val.get("updated_at_ms")
+            if not isinstance(updated_at_ms, int):
+                updated_at_ms = int(time.time() * 1000)
+
+            # Cap on load
+            if len(cleaned_history) > self._max_turns:
+                cleaned_history = cleaned_history[-self._max_turns :]
+
+            self._data[key] = Session(ticket_key=ticket_key, history=cleaned_history, updated_at_ms=updated_at_ms)
+
+    def get(self, key: str) -> Session:
+        with self._lock:
+            self._load_locked()
+            sess = self._data.get(key)
+            if sess is None:
+                sess = Session(ticket_key=None, history=[], updated_at_ms=int(time.time() * 1000))
+                self._data[key] = sess
+            return sess
+
+    def save(self) -> None:
+        with self._lock:
+            self._load_locked()
+            parent = os.path.dirname(self._path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+            payload = {
+                "version": 1,
+                "sessions": {
+                    k: {"ticket_key": v.ticket_key, "history": v.history, "updated_at_ms": v.updated_at_ms}
+                    for k, v in self._data.items()
+                },
+            }
+
+            fd, tmp_path = tempfile.mkstemp(prefix=".slackbot_sessions_", suffix=".json", dir=parent or None)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False)
+                    f.write("\n")
+                os.replace(tmp_path, self._path)
+            finally:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
 
 
 def _strip_ansi(s: str) -> str:
@@ -131,16 +239,101 @@ def _compact_context_md(full_md: str) -> str:
 
 def _build_prompt(*, ticket_key: str, question: str, context_md: str) -> str:
     return (
-        "You are a helpful engineering assistant.\n"
+        "You are BugBot, a Slack bot that answers questions about a Jira ticket / PR using a saved PR review context file.\n"
+        "Your user is chatting with you in Slack and expects Slack-friendly output.\n"
         "Use ONLY the provided PR Review Context to answer.\n"
         "If the context is missing the needed detail, say what is missing.\n"
-        "Be concise.\n\n"
+        "Be concise.\n"
+        "Output format for Slack:\n"
+        "- Prefer plain text.\n"
+        "- Use '-' bullets.\n"
+        "- Do NOT use Markdown bold like **this** (Slack won't render it). Use plain text or *single-asterisk* if you must.\n"
+        "- Avoid headings like '###'.\n\n"
         f"Ticket: {ticket_key}\n"
         f"Question: {question}\n\n"
         "--- BEGIN PR REVIEW CONTEXT ---\n"
         f"{context_md}\n"
         "--- END PR REVIEW CONTEXT ---\n"
     )
+
+def _format_history_for_prompt(history: list[dict[str, str]]) -> str:
+    lines: list[str] = []
+    for item in history:
+        role = item.get("role")
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        if role == "user":
+            lines.append(f"User: {text}")
+        elif role == "assistant":
+            lines.append(f"Assistant: {text}")
+    return "\n".join(lines).strip()
+
+def _build_prompt_with_history(
+    *,
+    ticket_key: str,
+    question: str,
+    context_md: str,
+    history: list[dict[str, str]],
+) -> str:
+    transcript = _format_history_for_prompt(history)
+    return (
+        "You are BugBot, a Slack bot that answers questions about a Jira ticket / PR using a saved PR review context file.\n"
+        "Your user is chatting with you in Slack and expects Slack-friendly output.\n"
+        "Use ONLY the provided PR Review Context and the conversation so far.\n"
+        "If the context is missing the needed detail, say what is missing.\n"
+        "Be concise.\n"
+        "Output format for Slack:\n"
+        "- Prefer plain text.\n"
+        "- Use '-' bullets.\n"
+        "- Do NOT use Markdown bold like **this** (Slack won't render it). Use plain text or *single-asterisk* if you must.\n"
+        "- Avoid headings like '###'.\n\n"
+        f"Ticket: {ticket_key}\n\n"
+        "--- BEGIN PR REVIEW CONTEXT ---\n"
+        f"{context_md}\n"
+        "--- END PR REVIEW CONTEXT ---\n\n"
+        "--- BEGIN CONVERSATION SO FAR ---\n"
+        f"{transcript}\n"
+        "--- END CONVERSATION SO FAR ---\n\n"
+        f"Latest user question: {question}\n"
+    )
+
+def _normalize_for_slack(text: str) -> str:
+    """
+    Slack mrkdwn does not treat **bold** as bold (it uses *bold*).
+    Keep formatting simple and safe for Slack rendering.
+    """
+    s = (text or "").replace("\r\n", "\n").strip()
+    if not s:
+        return s
+
+    in_code_block = False
+    out_lines: list[str] = []
+    for line in s.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            out_lines.append(line)
+            continue
+
+        if in_code_block:
+            out_lines.append(line)
+            continue
+
+        # Convert common Markdown bold to Slack-style bold.
+        line2 = line.replace("**", "*")
+
+        # Convert Markdown headings to a single plain line.
+        m = re.match(r"^\s{0,3}(#{1,6})\s+(.*)$", line2)
+        if m:
+            title = (m.group(2) or "").strip()
+            if title:
+                out_lines.append(title)
+            continue
+
+        out_lines.append(line2)
+
+    return "\n".join(out_lines).strip()
 
 
 def _run_cursor_agent(prompt: str) -> str:
@@ -222,8 +415,144 @@ def _handle_message_text(text: str) -> str:
     prompt = _build_prompt(ticket_key=parsed.ticket_key, question=parsed.question, context_md=context_md)
     return _run_cursor_agent(prompt)
 
+def _handle_dm_text(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return f"Send: `{PROJECT_PREFIX}-1234 <question>` (or `1234 <question>`)."
+
+    ticket_key = _normalize_ticket_key(text)
+    if not ticket_key:
+        return f"Send: `{PROJECT_PREFIX}-1234 <question>` (or `1234 <question>`)."
+
+    question = text
+    question = re.sub(rf"\b{re.escape(ticket_key)}\b", "", question, count=1, flags=re.IGNORECASE).strip()
+    question = re.sub(rf"\b{re.escape(ticket_key.split('-', 1)[1])}\b", "", question, count=1).strip()
+    if not question:
+        return "Please include a question after the ticket key/number."
+
+    path = _find_review_context_file(ticket_key)
+    if not path:
+        return (
+            f"Could not find a `review_context` summary for `{ticket_key}`.\n"
+            f"Expected a file named like `{ticket_key}.md` or containing the ticket key under `{REVIEW_CONTEXT_DIR}`."
+        )
+
+    context_full = _read_context_md(path)
+    context_md = _compact_context_md(context_full)
+    prompt = _build_prompt(ticket_key=ticket_key, question=question, context_md=context_md)
+    return _run_cursor_agent(prompt)
+
+
+def _session_key(*, team_id: str, channel_id: str, thread_ts: str) -> str:
+    return f"{team_id}:{channel_id}:{thread_ts}"
+
+
+def _remove_leading_mentions(text: str) -> str:
+    return re.sub(r"^(?:<@[^>]+>\s*)+", "", (text or "").strip()).strip()
+
+
+def _parse_ticket_and_question(*, raw_text: str, is_app_mention: bool) -> tuple[Optional[str], str]:
+    text = (raw_text or "").strip()
+    if is_app_mention:
+        text = _remove_leading_mentions(text)
+    if not text:
+        return None, ""
+
+    ticket_key = _normalize_ticket_key(text)
+    if not ticket_key:
+        return None, text
+
+    question = text
+    question = re.sub(rf"\b{re.escape(ticket_key)}\b", "", question, count=1, flags=re.IGNORECASE).strip()
+    question = re.sub(rf"\b{re.escape(ticket_key.split('-', 1)[1])}\b", "", question, count=1).strip()
+    return ticket_key, question
+
+
+def _cap_history(history: list[dict[str, str]]) -> list[dict[str, str]]:
+    if MAX_TURNS <= 0:
+        return []
+    if len(history) <= MAX_TURNS:
+        return history
+    return history[-MAX_TURNS:]
+
+
+def _answer_with_session(
+    *,
+    store: SessionStore,
+    log: logging.Logger,
+    team_id: str,
+    channel_id: str,
+    thread_ts: str,
+    raw_text: str,
+    is_app_mention: bool,
+) -> str:
+    key = _session_key(team_id=team_id, channel_id=channel_id, thread_ts=thread_ts)
+    sess = store.get(key)
+
+    incoming_ticket, question = _parse_ticket_and_question(raw_text=raw_text, is_app_mention=is_app_mention)
+    question = (question or "").strip()
+
+    if incoming_ticket:
+        if sess.ticket_key is None or sess.ticket_key != incoming_ticket:
+            sess.ticket_key = incoming_ticket
+
+    if not sess.ticket_key:
+        return (
+            f"Send: `{PROJECT_PREFIX}-1234 <question>` (or `1234 <question>`). "
+            "Follow-ups must be in the same Slack thread."
+        )
+
+    if not question:
+        return "Please include a question."
+
+    sess.history.append({"role": "user", "text": question})
+    sess.history = _cap_history(sess.history)
+    sess.updated_at_ms = int(time.time() * 1000)
+    store.save()
+
+    path = _find_review_context_file(sess.ticket_key)
+    if not path:
+        return (
+            f"Could not find a `review_context` summary for `{sess.ticket_key}`.\n"
+            f"Expected a file named like `{sess.ticket_key}.md` or containing the ticket key under `{REVIEW_CONTEXT_DIR}`."
+        )
+
+    context_full = _read_context_md(path)
+    context_md = _compact_context_md(context_full)
+
+    # Prompt transcript excludes the just-added user line; the latest question is provided separately.
+    prior_history = sess.history[:-1]
+    prompt = _build_prompt_with_history(
+        ticket_key=sess.ticket_key,
+        question=question,
+        context_md=context_md,
+        history=prior_history,
+    )
+    answer = _run_cursor_agent(prompt)
+    answer = _normalize_for_slack(answer)
+
+    sess.history.append({"role": "assistant", "text": answer})
+    sess.history = _cap_history(sess.history)
+    sess.updated_at_ms = int(time.time() * 1000)
+    store.save()
+
+    try:
+        log.info("Answered: session=%s ticket=%s history_len=%d", key, sess.ticket_key, len(sess.history))
+    except Exception:
+        pass
+
+    return answer
+
 
 def main() -> None:
+    log_level = (os.getenv("SLACKBOT_LOG_LEVEL", "INFO") or "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="[slackbot] %(asctime)s %(levelname)s %(message)s",
+    )
+    log = logging.getLogger("slackbot")
+    store = SessionStore(path=SESSIONS_PATH, max_turns=MAX_TURNS)
+
     slack_bot_token = os.environ.get("SLACK_BOT_TOKEN")
     slack_app_token = os.environ.get("SLACK_APP_TOKEN")  # xapp-... (Socket Mode)
 
@@ -238,6 +567,11 @@ def main() -> None:
 
     @app.event("app_mention")
     def on_app_mention(body, event, say, context, logger):
+        try:
+            log.info("Received app_mention event: channel=%s user=%s ts=%s text=%r", event.get("channel"), event.get("user"), event.get("ts"), event.get("text"))
+        except Exception:
+            pass
+
         # Avoid bot loops
         if event.get("subtype") == "bot_message" or event.get("bot_id"):
             return
@@ -248,6 +582,7 @@ def main() -> None:
         text = event.get("text", "") or ""
         channel = event.get("channel")
         thread_ts = event.get("thread_ts") or event.get("ts")
+        team_id = body.get("team_id") or event.get("team") or "unknown"
 
         try:
             say(text="Working on it…", thread_ts=thread_ts)
@@ -256,7 +591,15 @@ def main() -> None:
 
         def work():
             try:
-                answer = _handle_message_text(text)
+                answer = _answer_with_session(
+                    store=store,
+                    log=log,
+                    team_id=str(team_id),
+                    channel_id=str(channel),
+                    thread_ts=str(thread_ts),
+                    raw_text=text,
+                    is_app_mention=True,
+                )
                 for chunk in _chunk_for_slack(answer, SLACK_MAX_CHARS):
                     say(text=chunk, thread_ts=thread_ts)
             except Exception as e:
@@ -265,6 +608,69 @@ def main() -> None:
 
         _EXECUTOR.submit(work)
 
+    @app.event("message")
+    def on_message(body, event, say, context, logger):
+        """
+        Handle direct messages and group DMs to the bot.
+        Slack will send this event only if Event Subscriptions includes message.im / message.mpim
+        and the bot has im:history / mpim:history scopes.
+        """
+        channel_type = event.get("channel_type")
+        if channel_type not in ("im", "mpim"):
+            return
+
+        # Ignore message edits/joins/etc.
+        if event.get("subtype"):
+            return
+
+        # Avoid bot loops
+        if event.get("bot_id"):
+            return
+        bot_user_id = context.get("bot_user_id")
+        if bot_user_id and event.get("user") == bot_user_id:
+            return
+
+        text = event.get("text", "") or ""
+        thread_ts = event.get("thread_ts") or event.get("ts")
+        channel = event.get("channel")
+        team_id = body.get("team_id") or event.get("team") or "unknown"
+
+        try:
+            log.info(
+                "Received DM message event: channel_type=%s user=%s ts=%s text=%r",
+                channel_type,
+                event.get("user"),
+                event.get("ts"),
+                text,
+            )
+        except Exception:
+            pass
+
+        try:
+            say(text="Working on it…", thread_ts=thread_ts)
+        except Exception:
+            pass
+
+        def work():
+            try:
+                answer = _answer_with_session(
+                    store=store,
+                    log=log,
+                    team_id=str(team_id),
+                    channel_id=str(channel),
+                    thread_ts=str(thread_ts),
+                    raw_text=text,
+                    is_app_mention=False,
+                )
+                for chunk in _chunk_for_slack(answer, SLACK_MAX_CHARS):
+                    say(text=chunk, thread_ts=thread_ts)
+            except Exception as e:
+                logger.exception("slackbot DM processing failed")
+                say(text=f"Error: {e}", thread_ts=thread_ts)
+
+        _EXECUTOR.submit(work)
+
+    log.info("Starting Socket Mode handler…")
     SocketModeHandler(app, slack_app_token).start()
 
 

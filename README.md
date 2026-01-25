@@ -135,6 +135,11 @@ This folder also includes `slackbot.py`, a Socket Mode Slack bot that listens fo
 
 `@bugbot LAB-28330 what changed and what might be impacted?`
 
+Follow-ups:
+
+- In a channel: reply in the **same thread**. After the first message sets the ticket, follow-ups can omit the ticket key.
+- In DMs: follow-ups are **thread-only** as well (use Slack “Reply in thread”).
+
 It will:
 
 - Find the matching markdown file in `review_context/`
@@ -151,9 +156,11 @@ In your Slack app:
   - Save it as `SLACK_APP_TOKEN` (starts with `xapp-`)
 - Enable **Event Subscriptions**
   - Subscribe to the bot event: `app_mention`
+  - (For DMs) Also subscribe to: `message.im` and `message.mpim`
 - OAuth scopes (Bot Token Scopes)
   - `app_mentions:read`
   - `chat:write`
+  - (For DMs) Also add: `im:history` and `mpim:history`
 - Install the app to your workspace (gives `SLACK_BOT_TOKEN`, starts with `xoxb-`)
 - Invite the app to the channel(s) where you want it to respond: `/invite @YourAppName`
 
@@ -174,7 +181,7 @@ export SLACK_BOT_TOKEN="xoxb-..."
 export SLACK_APP_TOKEN="xapp-..."
 
 # Optional:
-export CURSOR_MODEL="gpt-5"
+export CURSOR_MODEL="gpt-5.2-high"
 export CURSOR_TIMEOUT_SECONDS="90"
 
 python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/slackbot.py"
@@ -185,9 +192,11 @@ python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/slackbot.py"
 - `REVIEW_CONTEXT_DIR`: defaults to `/Users/jonathaneshel/Desktop/Code/bugbot files/review_context`
 - `PROJECT_PREFIX`: defaults to `LAB`
 - `CURSOR_BIN`: defaults to `cursor-agent`
-- `CURSOR_MODEL`: defaults to `gpt-5`
+- `CURSOR_MODEL`: defaults to `gpt-5.2-high`
 - `CURSOR_TIMEOUT_SECONDS`: defaults to `90`
 - `SLACK_MAX_CHARS`: defaults to `3500`
 - `SLACKBOT_WORKERS`: defaults to `4`
+- `SLACKBOT_SESSIONS_PATH`: defaults to `/Users/jonathaneshel/Desktop/Code/bugbot files/.slackbot_sessions.json`
+- `SLACKBOT_MAX_TURNS`: defaults to `50` (history entries stored per thread)
 
 
