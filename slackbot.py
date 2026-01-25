@@ -19,20 +19,26 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 BUGBOT_FILES_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_REVIEW_CONTEXT_DIR = os.path.join(BUGBOT_FILES_DIR, "review_context")
+DEFAULT_LABGURU_REPO_DIR = "/Users/jonathaneshel/Desktop/Code/Labguru"
 
 REVIEW_CONTEXT_DIR = os.getenv("REVIEW_CONTEXT_DIR", DEFAULT_REVIEW_CONTEXT_DIR)
 PROJECT_PREFIX = (os.getenv("PROJECT_PREFIX", "LAB") or "LAB").strip().upper()
 
 CURSOR_BIN = os.getenv("CURSOR_BIN", "cursor-agent")
 CURSOR_MODEL = os.getenv("CURSOR_MODEL", "gpt-5.2-high")
-CURSOR_TIMEOUT_SECONDS = float(os.getenv("CURSOR_TIMEOUT_SECONDS", "90"))
+CURSOR_TIMEOUT_SECONDS = float(os.getenv("CURSOR_TIMEOUT_SECONDS", "240"))
 
 SLACK_MAX_CHARS = int(os.getenv("SLACK_MAX_CHARS", "3500"))
 WORKERS = int(os.getenv("SLACKBOT_WORKERS", "4"))
 
+LABGURU_REPO_DIR = os.getenv("LABGURU_REPO_DIR", DEFAULT_LABGURU_REPO_DIR)
+
 DEFAULT_SESSIONS_PATH = os.path.join(BUGBOT_FILES_DIR, ".slackbot_sessions.json")
 SESSIONS_PATH = os.getenv("SLACKBOT_SESSIONS_PATH", DEFAULT_SESSIONS_PATH)
 MAX_TURNS = int(os.getenv("SLACKBOT_MAX_TURNS", "50"))
+
+SLOW_UPDATE_SECONDS = float(os.getenv("SLACKBOT_SLOW_UPDATE_SECONDS", "30"))
+SLOW_UPDATE_TEXT = os.getenv("SLACKBOT_SLOW_UPDATE_TEXT", "Still working…")
 
 DROP_EXACT_LINES = {"INSTRUCTIONS RECIEVED", "STARTED READING"}
 
@@ -241,12 +247,13 @@ def _build_prompt(*, ticket_key: str, question: str, context_md: str) -> str:
     return (
         "You are BugBot, a Slack bot that answers questions about a Jira ticket / PR using a saved PR review context file.\n"
         "Your user is chatting with you in Slack and expects Slack-friendly output.\n"
-        "Use ONLY the provided PR Review Context to answer.\n"
+        "Use the provided PR Review Context as the primary source of truth.\n"
+        "If needed, you may inspect the local Labguru repo code to verify details.\n"
         "If the context is missing the needed detail, say what is missing.\n"
         "Be concise.\n"
         "Output format for Slack:\n"
         "- Prefer plain text.\n"
-        "- Use '-' bullets.\n"
+        "- Use bullet points prefixed with '• ' (not '-').\n"
         "- Do NOT use Markdown bold like **this** (Slack won't render it). Use plain text or *single-asterisk* if you must.\n"
         "- Avoid headings like '###'.\n\n"
         f"Ticket: {ticket_key}\n"
@@ -280,12 +287,13 @@ def _build_prompt_with_history(
     return (
         "You are BugBot, a Slack bot that answers questions about a Jira ticket / PR using a saved PR review context file.\n"
         "Your user is chatting with you in Slack and expects Slack-friendly output.\n"
-        "Use ONLY the provided PR Review Context and the conversation so far.\n"
+        "Use the provided PR Review Context and the conversation so far.\n"
+        "You may inspect the local Labguru repo code if needed to answer precisely.\n"
         "If the context is missing the needed detail, say what is missing.\n"
         "Be concise.\n"
         "Output format for Slack:\n"
         "- Prefer plain text.\n"
-        "- Use '-' bullets.\n"
+        "- Use bullet points prefixed with '• ' (not '-').\n"
         "- Do NOT use Markdown bold like **this** (Slack won't render it). Use plain text or *single-asterisk* if you must.\n"
         "- Avoid headings like '###'.\n\n"
         f"Ticket: {ticket_key}\n\n"
@@ -331,6 +339,10 @@ def _normalize_for_slack(text: str) -> str:
                 out_lines.append(title)
             continue
 
+        # Convert common Markdown list markers to a single bullet style.
+        line2 = re.sub(r"^(\s*)-\s+", r"\1• ", line2)
+        line2 = re.sub(r"^(\s*)\*\s+", r"\1• ", line2)
+
         out_lines.append(line2)
 
     return "\n".join(out_lines).strip()
@@ -339,7 +351,8 @@ def _normalize_for_slack(text: str) -> str:
 def _run_cursor_agent(prompt: str) -> str:
     cmd = [CURSOR_BIN, "-p", prompt, "--model", CURSOR_MODEL]
     try:
-        p = subprocess.run(cmd, text=True, capture_output=True, timeout=CURSOR_TIMEOUT_SECONDS)
+        cwd = LABGURU_REPO_DIR if (LABGURU_REPO_DIR and os.path.isdir(LABGURU_REPO_DIR)) else BUGBOT_FILES_DIR
+        p = subprocess.run(cmd, text=True, capture_output=True, timeout=CURSOR_TIMEOUT_SECONDS, cwd=cwd)
     except FileNotFoundError:
         return f"Error: `{CURSOR_BIN}` not found on PATH."
     except subprocess.TimeoutExpired:
@@ -393,6 +406,73 @@ def _chunk_for_slack(text: str, max_chars: int) -> list[str]:
         if c:
             final.append(c)
     return final
+
+
+def _post_placeholder(*, client, channel: str, thread_ts: str) -> Optional[str]:
+    """
+    Posts a placeholder message and returns its ts so we can edit it later.
+    Falls back to None if posting fails.
+    """
+    try:
+        res = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="Working on it…")
+        ts = res.get("ts") if isinstance(res, dict) else None
+        return str(ts) if ts else None
+    except Exception:
+        return None
+
+
+def _update_or_post_answer(
+    *,
+    client,
+    channel: str,
+    thread_ts: str,
+    placeholder_ts: Optional[str],
+    answer: str,
+) -> None:
+    chunks = _chunk_for_slack(answer, SLACK_MAX_CHARS)
+    first = chunks[0] if chunks else "(empty)"
+    rest = chunks[1:] if len(chunks) > 1 else []
+
+    updated = False
+    if placeholder_ts:
+        try:
+            client.chat_update(channel=channel, ts=placeholder_ts, text=first)
+            updated = True
+        except Exception:
+            updated = False
+
+    if not updated:
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=first)
+
+    for chunk in rest:
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=chunk)
+
+def _schedule_slow_placeholder_update(
+    *,
+    future,
+    client,
+    channel: str,
+    placeholder_ts: Optional[str],
+) -> None:
+    """
+    If answering takes longer than SLOW_UPDATE_SECONDS, edit the placeholder message once.
+    """
+    if not placeholder_ts:
+        return
+    if SLOW_UPDATE_SECONDS <= 0:
+        return
+
+    def fire() -> None:
+        try:
+            if future.done():
+                return
+            client.chat_update(channel=channel, ts=placeholder_ts, text=SLOW_UPDATE_TEXT)
+        except Exception:
+            return
+
+    t = threading.Timer(SLOW_UPDATE_SECONDS, fire)
+    t.daemon = True
+    t.start()
 
 
 def _handle_message_text(text: str) -> str:
@@ -566,7 +646,7 @@ def main() -> None:
     app = App(token=slack_bot_token)
 
     @app.event("app_mention")
-    def on_app_mention(body, event, say, context, logger):
+    def on_app_mention(body, event, say, context, logger, client):
         try:
             log.info("Received app_mention event: channel=%s user=%s ts=%s text=%r", event.get("channel"), event.get("user"), event.get("ts"), event.get("text"))
         except Exception:
@@ -584,32 +664,36 @@ def main() -> None:
         thread_ts = event.get("thread_ts") or event.get("ts")
         team_id = body.get("team_id") or event.get("team") or "unknown"
 
-        try:
-            say(text="Working on it…", thread_ts=thread_ts)
-        except Exception:
-            pass
+        placeholder_ts = _post_placeholder(client=client, channel=str(channel), thread_ts=str(thread_ts))
 
         def work():
-            try:
-                answer = _answer_with_session(
-                    store=store,
-                    log=log,
-                    team_id=str(team_id),
-                    channel_id=str(channel),
-                    thread_ts=str(thread_ts),
-                    raw_text=text,
-                    is_app_mention=True,
-                )
-                for chunk in _chunk_for_slack(answer, SLACK_MAX_CHARS):
-                    say(text=chunk, thread_ts=thread_ts)
-            except Exception as e:
-                logger.exception("slackbot processing failed")
-                say(text=f"Error: {e}", thread_ts=thread_ts)
+            answer = _answer_with_session(
+                store=store,
+                log=log,
+                team_id=str(team_id),
+                channel_id=str(channel),
+                thread_ts=str(thread_ts),
+                raw_text=text,
+                is_app_mention=True,
+            )
+            _update_or_post_answer(
+                client=client,
+                channel=str(channel),
+                thread_ts=str(thread_ts),
+                placeholder_ts=placeholder_ts,
+                answer=answer,
+            )
 
-        _EXECUTOR.submit(work)
+        future = _EXECUTOR.submit(work)
+        _schedule_slow_placeholder_update(
+            future=future,
+            client=client,
+            channel=str(channel),
+            placeholder_ts=placeholder_ts,
+        )
 
     @app.event("message")
-    def on_message(body, event, say, context, logger):
+    def on_message(body, event, say, context, logger, client):
         """
         Handle direct messages and group DMs to the bot.
         Slack will send this event only if Event Subscriptions includes message.im / message.mpim
@@ -646,29 +730,33 @@ def main() -> None:
         except Exception:
             pass
 
-        try:
-            say(text="Working on it…", thread_ts=thread_ts)
-        except Exception:
-            pass
+        placeholder_ts = _post_placeholder(client=client, channel=str(channel), thread_ts=str(thread_ts))
 
         def work():
-            try:
-                answer = _answer_with_session(
-                    store=store,
-                    log=log,
-                    team_id=str(team_id),
-                    channel_id=str(channel),
-                    thread_ts=str(thread_ts),
-                    raw_text=text,
-                    is_app_mention=False,
-                )
-                for chunk in _chunk_for_slack(answer, SLACK_MAX_CHARS):
-                    say(text=chunk, thread_ts=thread_ts)
-            except Exception as e:
-                logger.exception("slackbot DM processing failed")
-                say(text=f"Error: {e}", thread_ts=thread_ts)
+            answer = _answer_with_session(
+                store=store,
+                log=log,
+                team_id=str(team_id),
+                channel_id=str(channel),
+                thread_ts=str(thread_ts),
+                raw_text=text,
+                is_app_mention=False,
+            )
+            _update_or_post_answer(
+                client=client,
+                channel=str(channel),
+                thread_ts=str(thread_ts),
+                placeholder_ts=placeholder_ts,
+                answer=answer,
+            )
 
-        _EXECUTOR.submit(work)
+        future = _EXECUTOR.submit(work)
+        _schedule_slow_placeholder_update(
+            future=future,
+            client=client,
+            channel=str(channel),
+            placeholder_ts=placeholder_ts,
+        )
 
     log.info("Starting Socket Mode handler…")
     SocketModeHandler(app, slack_app_token).start()

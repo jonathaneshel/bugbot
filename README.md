@@ -190,13 +190,16 @@ python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/slackbot.py"
 ### Optional environment variables
 
 - `REVIEW_CONTEXT_DIR`: defaults to `/Users/jonathaneshel/Desktop/Code/bugbot files/review_context`
+- `LABGURU_REPO_DIR`: defaults to `/Users/jonathaneshel/Desktop/Code/Labguru` (where `cursor-agent` runs so it can read the repo if needed)
 - `PROJECT_PREFIX`: defaults to `LAB`
 - `CURSOR_BIN`: defaults to `cursor-agent`
 - `CURSOR_MODEL`: defaults to `gpt-5.2-high`
-- `CURSOR_TIMEOUT_SECONDS`: defaults to `90`
+- `CURSOR_TIMEOUT_SECONDS`: defaults to `240`
 - `SLACK_MAX_CHARS`: defaults to `3500`
 - `SLACKBOT_WORKERS`: defaults to `4`
 - `SLACKBOT_SESSIONS_PATH`: defaults to `/Users/jonathaneshel/Desktop/Code/bugbot files/.slackbot_sessions.json`
 - `SLACKBOT_MAX_TURNS`: defaults to `50` (history entries stored per thread)
+- `SLACKBOT_SLOW_UPDATE_SECONDS`: defaults to `30` (after this many seconds, edit the placeholder if still running)
+- `SLACKBOT_SLOW_UPDATE_TEXT`: defaults to `Still working…`
 
 

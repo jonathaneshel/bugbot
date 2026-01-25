@@ -7,7 +7,7 @@ Ticket runner:
 - require cursor-agent to output COMMIT_NAME: ... and print it (no local fallback)
 
 Then the script will:
-- git add -A
+- stage tracked changes + newly created files from this run (avoids accidentally adding pre-existing untracked files)
 - git commit -m "<COMMIT_NAME from Cursor>"
 - git push --force (sets upstream to origin/<current-branch> if needed)
 - karamba pr LAB-<NUMBER>
@@ -241,6 +241,92 @@ def _git_origin_head_branch(repo_dir: str) -> str:
     return "main"
 
 
+def _read_karamba_env(repo_dir: str) -> dict[str, str]:
+    """
+    Reads a simple KEY=VALUE file from <repo_dir>/.karamba.
+    Values may be quoted. Unknown/invalid lines are ignored.
+    """
+    path = os.path.join(repo_dir, ".karamba")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+    env: dict[str, str] = {}
+    for raw in lines:
+        line = (raw or "").strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = (key or "").strip()
+        val = (val or "").strip()
+        if not key:
+            continue
+        # Strip optional surrounding quotes
+        if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
+            val = val[1:-1]
+        env[key] = val
+    return env
+
+
+def _default_pr_base_branch(repo_dir: str) -> tuple[str, str]:
+    """
+    Best-effort: choose the branch that PRs are typically opened against.
+    Prefer .karamba STAGING_BRANCH (git_flow), else MAIN_BRANCH, else origin/HEAD-derived.
+    Returns (branch_name, source_note).
+    """
+    cfg = _read_karamba_env(repo_dir)
+    staging = (cfg.get("STAGING_BRANCH") or "").strip()
+    if staging:
+        return staging, "from .karamba STAGING_BRANCH"
+    main = (cfg.get("MAIN_BRANCH") or "").strip()
+    if main:
+        return main, "from .karamba MAIN_BRANCH"
+    return _git_origin_head_branch(repo_dir), "from origin/HEAD"
+
+
+def _resolve_base_ref(repo_dir: str, base_branch: str) -> tuple[str, str]:
+    """
+    Resolve a base branch name into an existing ref we can diff against.
+    Prefers origin/<branch>, then local <branch>. Falls back to origin/HEAD-derived.
+    Returns (base_ref, note) where base_ref is like 'origin/staging' or 'staging'.
+    """
+    base_branch = (base_branch or "").strip()
+    if not base_branch:
+        base_branch, src = _default_pr_base_branch(repo_dir)
+    else:
+        src = "provided"
+
+    origin_ref = f"refs/remotes/origin/{base_branch}"
+    local_ref = f"refs/heads/{base_branch}"
+
+    has_origin = _run_cmd(
+        cmd=["git", "show-ref", "--verify", "--quiet", origin_ref],
+        cwd=repo_dir,
+        capture_output=True,
+        check=False,
+    ).returncode == 0
+    if has_origin:
+        return f"origin/{base_branch}", src
+
+    has_local = _run_cmd(
+        cmd=["git", "show-ref", "--verify", "--quiet", local_ref],
+        cwd=repo_dir,
+        capture_output=True,
+        check=False,
+    ).returncode == 0
+    if has_local:
+        return base_branch, src
+
+    fallback, fallback_src = _default_pr_base_branch(repo_dir)
+    # If that fallback is also missing, we still return origin/<fallback> (git diff will just be empty/error,
+    # but the packet will include the chosen base for debugging).
+    return f"origin/{fallback}", f"fallback ({fallback_src})"
+
+
 def write_pr_review_context_file(
     *,
     ticket_number: str,
@@ -264,24 +350,26 @@ def write_pr_review_context_file(
     )
     head_sha = (head_sha_res.stdout or "").strip() if head_sha_res.returncode == 0 else "(unknown)"
 
-    base_branch = _git_origin_head_branch(repo_dir)
+    base_branch, base_branch_source = _default_pr_base_branch(repo_dir)
+    base_ref, base_ref_source = _resolve_base_ref(repo_dir, base_branch)
+    diff_range = f"{base_ref}...HEAD"
 
     name_status = _run_cmd(
-        cmd=["git", "diff", "--name-status", f"origin/{base_branch}...HEAD"],
+        cmd=["git", "diff", "--name-status", diff_range],
         cwd=repo_dir,
         capture_output=True,
         check=False,
     ).stdout or ""
 
     diff_stat = _run_cmd(
-        cmd=["git", "diff", "--stat", f"origin/{base_branch}...HEAD"],
+        cmd=["git", "diff", "--stat", diff_range],
         cwd=repo_dir,
         capture_output=True,
         check=False,
     ).stdout or ""
 
     patch = _run_cmd(
-        cmd=["git", "diff", f"origin/{base_branch}...HEAD"],
+        cmd=["git", "diff", diff_range],
         cwd=repo_dir,
         capture_output=True,
         check=False,
@@ -301,7 +389,9 @@ def write_pr_review_context_file(
         Repo: {repo_dir}
         Branch: {branch}
         HEAD: {head_sha}
-        Base: origin/{base_branch}
+        Base branch: {base_branch} ({base_branch_source})
+        Base ref used: {base_ref} ({base_ref_source})
+        Diff range: {diff_range}
         PR: {pr_status}
 
         ## Ticket
@@ -1117,11 +1207,42 @@ def _ensure_git_repo(repo_dir: str) -> None:
         raise RuntimeError(f"Not a git repository: {repo_dir}")
 
 
+def _git_untracked_files(repo_dir: str) -> set[str]:
+    """
+    Returns a set of untracked file paths relative to repo root.
+    Uses NUL-separated porcelain for safe parsing.
+    """
+    res = _run_cmd(
+        cmd=["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=repo_dir,
+        capture_output=True,
+        check=False,
+    )
+    out = res.stdout or ""
+    untracked: set[str] = set()
+    for entry in out.split("\0"):
+        if not entry:
+            continue
+        # Untracked entries look like: "?? path"
+        if entry.startswith("?? "):
+            path = entry[3:].strip()
+            if path:
+                untracked.add(path)
+    return untracked
+
+
+def _chunked(items: list[str], size: int) -> list[list[str]]:
+    if size <= 0:
+        return [items]
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
 def run_git_commit_push_and_pr(
     *,
     repo_dir: str,
     issue_key: str,
     commit_name_from_cursor: str,
+    preexisting_untracked: Optional[set[str]] = None,
 ) -> tuple[Optional[str], str]:
     _ensure_git_repo(repo_dir)
 
@@ -1136,8 +1257,21 @@ def run_git_commit_push_and_pr(
             "Proceeding anyway (Cursor is the source of truth)."
         )
 
-    _log("Staging changes (git add -A)...")
-    _run_cmd(cmd=["git", "add", "-A"], cwd=repo_dir)
+    if preexisting_untracked is None:
+        _log("Staging changes (git add -A)...")
+        _run_cmd(cmd=["git", "add", "-A"], cwd=repo_dir)
+    else:
+        _log("Staging changes (tracked changes + newly created files from this run)...")
+        # Tracked modifications/deletions:
+        _run_cmd(cmd=["git", "add", "-u"], cwd=repo_dir)
+
+        # Only stage untracked files that appeared during this run (avoid scooping up old junk).
+        post_untracked = _git_untracked_files(repo_dir)
+        new_untracked = sorted(post_untracked - preexisting_untracked)
+        if new_untracked:
+            _log(f"Staging {len(new_untracked)} newly created file(s) from this run...")
+            for chunk in _chunked(new_untracked, 100):
+                _run_cmd(cmd=["git", "add", "--", *chunk], cwd=repo_dir)
 
     _log(f"Committing changes (git commit -m {commit_message!r})...")
     commit_res = _run_cmd(
@@ -1316,6 +1450,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"Starting work: karamba new {issue_key}")
     run_karamba_new_in_repo(issue_key=issue_key, repo_dir=repo_dir)
 
+    # Snapshot untracked files BEFORE cursor-agent runs, so we don't accidentally add pre-existing
+    # untracked artifacts from the developer machine into the PR.
+    preexisting_untracked = _git_untracked_files(repo_dir)
+
     print(f"Fetching Jira issue LAB-{ticket_number} ...")
     issue = fetch_jira_issue(
         jira_base_url=args.jira_base_url,
@@ -1403,6 +1541,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             repo_dir=repo_dir,
             issue_key=issue_key,
             commit_name_from_cursor=runner_output.commit_name,
+            preexisting_untracked=preexisting_untracked,
         )
     except PrCreationError as e:
         pr_create_failed = True
