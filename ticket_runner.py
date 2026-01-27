@@ -43,6 +43,7 @@ DEFAULT_REPO_DIR = "/Users/jonathaneshel/Desktop/Code/Labguru"
 DEFAULT_CURSOR_LOG_FILE = os.path.join(BUGBOT_FILES_DIR, "logs", "last_cursor_agent.log")
 DEBUG_NDJSON_LOG_PATH = os.path.join(BUGBOT_FILES_DIR, ".cursor", "debug.log")
 DEBUG_RUN_ID = f"run-{int(time.time())}"
+BUGBOT_JIRA_LABEL = "BugBot"
 
 PLAN_MD_PATH = os.path.join(BUGBOT_FILES_DIR, "PLAN.md")
 API_RULES_MD_PATH = os.path.join(BUGBOT_FILES_DIR, "api summary.md")
@@ -76,6 +77,7 @@ class RunnerOutput:
     what_did_i_work_on_non_tech_pm: str
     what_might_be_impacted: str
     rca: str
+    # Optional; not required in RUNNER_OUTPUT anymore.
     rca_comments: str
     specs_status: str
     specs_details: str
@@ -756,7 +758,39 @@ def run_cursor_agent_interactive(
     if returncode != 0:
         raise RuntimeError("cursor-agent failed (see output above).")
 
-    runner_output = extract_runner_output_from_text(output)
+    try:
+        runner_output = extract_runner_output_from_text(output)
+    except RuntimeError as e:
+        msg = str(e)
+        if "Missing required runner output fields" in msg:
+            _log("Runner output missing required fields; re-asking Cursor once to emit the full block.")
+            followup_prompt = textwrap.dedent(
+                """
+                Your previous response was missing required RUNNER_OUTPUT fields.
+                Output ONLY the full machine-parseable block, including ALL required fields, and nothing else:
+
+                RUNNER_OUTPUT_BEGIN
+                COMMIT_NAME: <your proposed commit message>
+                WHAT_DID_I_WORK_ON_DEV: <...>
+                WHAT_DID_I_WORK_ON_TECH_PM: <...>
+                WHAT_DID_I_WORK_ON_NON_TECH_PM: <...>
+                WHAT_MIGHT_BE_IMPACTED: <...>
+                RCA: <...>
+                SPECS_STATUS: <must be EXACTLY one of: OK; FAILED; NOT_RUN>
+                SPECS_DETAILS: <required; include the spec command(s) you ran; if FAILED include brief failure; if NOT_RUN include why>
+                RUNNER_OUTPUT_END
+                """
+            ).strip() + "\n"
+            output = run_cursor_agent_capture_output(
+                prompt=followup_prompt,
+                repo_dir=repo_dir,
+                cursor_log_file=cursor_log_file,
+                timeout_seconds=600,
+                cursor_bin=cursor_bin,
+            )
+            runner_output = extract_runner_output_from_text(output)
+        else:
+            raise
     print("\nRUNNER OUTPUT (from Cursor):")
     print(f"COMMIT_NAME: {runner_output.commit_name}")
     print(f"WHAT_DID_I_WORK_ON_DEV: {runner_output.what_did_i_work_on_dev}")
@@ -765,6 +799,8 @@ def run_cursor_agent_interactive(
     print(f"WHAT_MIGHT_BE_IMPACTED: {runner_output.what_might_be_impacted}")
     print(f"RCA: {runner_output.rca}")
     print(f"RCA_COMMENTS: {runner_output.rca_comments}")
+    print(f"SPECS_STATUS: {runner_output.specs_status}")
+    print(f"SPECS_DETAILS: {runner_output.specs_details}")
 
 
 def _prepare_cursor_invocation(*, prompt: str, cursor_bin: str) -> tuple[list[str], str]:
@@ -1104,6 +1140,7 @@ def extract_runner_output_from_text(output: str) -> RunnerOutput:
         "Refactoring side effect",
         "Lack of unit test coverage",
         "Other",
+        "Other (add in comments)",
     }
 
     in_block = False
@@ -1135,6 +1172,8 @@ def extract_runner_output_from_text(output: str) -> RunnerOutput:
         "WHAT_MIGHT_BE_IMPACTED",
         "RCA",
         "RCA_COMMENTS",
+        "SPECS_STATUS",
+        "SPECS_DETAILS",
     }
     missing = sorted(required_keys - set(fields.keys()))
     if missing:
@@ -1145,10 +1184,19 @@ def extract_runner_output_from_text(output: str) -> RunnerOutput:
         raise RuntimeError("Runner output COMMIT_NAME was empty.")
 
     rca = fields["RCA"]
+    if rca == "Other (add in comments)":
+        rca = "Other"
     if rca not in allowed_rca:
         raise RuntimeError(
             "Runner output RCA was not one of the allowed values. "
             f"Got: {rca!r}"
+        )
+
+    specs_status = fields["SPECS_STATUS"]
+    if specs_status not in {"OK", "FAILED", "NOT_RUN"}:
+        raise RuntimeError(
+            "Runner output SPECS_STATUS must be EXACTLY one of: OK; FAILED; NOT_RUN. "
+            f"Got: {specs_status!r}"
         )
 
     return RunnerOutput(
@@ -1159,6 +1207,8 @@ def extract_runner_output_from_text(output: str) -> RunnerOutput:
         what_might_be_impacted=fields["WHAT_MIGHT_BE_IMPACTED"],
         rca=rca,
         rca_comments=fields["RCA_COMMENTS"],
+        specs_status=specs_status,
+        specs_details=fields["SPECS_DETAILS"],
     )
 
 
@@ -1243,6 +1293,7 @@ def run_git_commit_push_and_pr(
     issue_key: str,
     commit_name_from_cursor: str,
     preexisting_untracked: Optional[set[str]] = None,
+    create_pr: bool = True,
 ) -> tuple[Optional[str], str]:
     _ensure_git_repo(repo_dir)
 
@@ -1296,6 +1347,10 @@ def run_git_commit_push_and_pr(
     _log(f"Force pushing branch to origin (git push --force --set-upstream origin {branch})...")
     _run_cmd(cmd=["git", "push", "--force", "--set-upstream", "origin", branch], cwd=repo_dir)
 
+    if not create_pr:
+        _log("Skipping PR creation (redo-pr mode).")
+        return None, ""
+
     _log(f"Creating PR via karamba (karamba pr {issue_key})...")
     pr_res = _run_cmd(
         cmd=["karamba", "pr", issue_key],
@@ -1321,6 +1376,7 @@ def run_cursor_agent_capture_output(
     repo_dir: str,
     cursor_log_file: Optional[str],
     timeout_seconds: int,
+    retries: int = 0,
     cursor_bin: str = "cursor-agent",
 ) -> str:
     """
@@ -1336,28 +1392,48 @@ def run_cursor_agent_capture_output(
         {"repo_dir": repo_dir, "cursor_bin": cursor_bin, "timeout_seconds": timeout_seconds},
     )
     # #endregion agent log (debug ndjson)
-    res = subprocess.run(
-        cmd,
-        input=effective_prompt,
-        text=True,
-        capture_output=True,
-        cwd=repo_dir,
-        timeout=timeout_seconds,
-    )
-    # #region agent log (debug ndjson)
-    _debug_log(
-        "H11",
-        "ticket_runner.py:run_cursor_agent_capture_output",
-        "cursor_headless_end",
-        {
-            "returncode": int(res.returncode),
-            "stdout_len": len(res.stdout or ""),
-            "stderr_len": len(res.stderr or ""),
-        },
-    )
-    # #endregion agent log (debug ndjson)
-    if res.returncode != 0:
-        raise RuntimeError(res.stderr.strip() or "cursor-agent failed")
+    last_err: Optional[str] = None
+    last_stdout: str = ""
+    last_stderr: str = ""
+    attempt_count = max(1, int(retries) + 1)
+
+    for attempt_idx in range(attempt_count):
+        res = subprocess.run(
+            cmd,
+            input=effective_prompt,
+            text=True,
+            capture_output=True,
+            cwd=repo_dir,
+            timeout=timeout_seconds,
+        )
+        last_stdout = res.stdout or ""
+        last_stderr = res.stderr or ""
+
+        # #region agent log (debug ndjson)
+        _debug_log(
+            "H11",
+            "ticket_runner.py:run_cursor_agent_capture_output",
+            "cursor_headless_end",
+            {
+                "returncode": int(res.returncode),
+                "stdout_len": len(last_stdout),
+                "stderr_len": len(last_stderr),
+                "attempt": attempt_idx + 1,
+                "attempts_total": attempt_count,
+            },
+        )
+        # #endregion agent log (debug ndjson)
+
+        if res.returncode == 0:
+            last_err = None
+            break
+
+        err_msg = (last_stderr or "").strip() or "cursor-agent failed"
+        last_err = err_msg
+        if "connection stalled" in err_msg.lower() and attempt_idx < attempt_count - 1:
+            _log(f"cursor-agent failed with 'Connection stalled' (attempt {attempt_idx+1}/{attempt_count}); retrying...")
+            continue
+        break
     if cursor_log_file:
         try:
             log_path = os.path.abspath(os.path.expanduser(cursor_log_file))
@@ -1366,11 +1442,16 @@ def run_cursor_agent_capture_output(
                 os.makedirs(parent, exist_ok=True)
             # Overwrite each run so the default log stays small and always reflects the latest run.
             with open(log_path, "wb") as f:
-                f.write(res.stdout.encode("utf-8", errors="replace"))
+                f.write(last_stdout.encode("utf-8", errors="replace"))
+                if last_stderr.strip():
+                    f.write(b"\n\n--- STDERR ---\n")
+                    f.write(last_stderr.encode("utf-8", errors="replace"))
             _log(f"Wrote cursor-agent output to log file: {log_path}")
         except Exception as e:
             _log(f"Could not write cursor log file ({cursor_log_file}): {e}")
-    return res.stdout
+    if last_err is not None:
+        raise RuntimeError(last_err)
+    return last_stdout
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1421,6 +1502,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Timeout for cursor-agent in headless mode (seconds).",
     )
     parser.add_argument(
+        "--cursor-retries",
+        type=int,
+        default=2,
+        help="Retries for transient cursor-agent failures (e.g., 'Connection stalled').",
+    )
+    parser.add_argument(
         "--no-jira-field-update",
         action="store_true",
         help="Disable updating Jira fields from JIRA_INSTRUCTIONS (even if configured).",
@@ -1429,6 +1516,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--non-interactive",
         action="store_true",
         help="Run cursor-agent headlessly (no stdin forwarding for clarifying questions).",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Run cursor-agent interactively (stdin forwarded). Overrides --non-interactive.",
+    )
+    parser.add_argument(
+        "--redo-pr",
+        action="store_true",
+        help="Redo an existing PR: do NOT run karamba new and do NOT run karamba pr. "
+        "Assumes you already checked out the PR branch locally; will run Cursor, commit, and force-push.",
     )
 
     args = parser.parse_args(argv)
@@ -1447,8 +1545,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     issue_key = f"{args.project_prefix}-{ticket_number}"
-    print(f"Starting work: karamba new {issue_key}")
-    run_karamba_new_in_repo(issue_key=issue_key, repo_dir=repo_dir)
+    if not args.redo_pr:
+        print(f"Starting work: karamba new {issue_key}")
+        run_karamba_new_in_repo(issue_key=issue_key, repo_dir=repo_dir)
+    else:
+        _log("redo-pr mode enabled: skipping karamba new; operating on current git branch.")
 
     # Snapshot untracked files BEFORE cursor-agent runs, so we don't accidentally add pre-existing
     # untracked artifacts from the developer machine into the PR.
@@ -1466,9 +1567,41 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"Ticket: {issue.key} — {issue.summary}")
     print(f"URL: {issue.url}")
 
+    # Ensure the ticket is labeled so it’s easy to find BugBot-handled tickets.
+    # fetch_jira_issue returns a JiraIssue dataclass; we need labels from the raw issue JSON.
+    # We re-fetch once (cheap) to avoid changing fetch_jira_issue’s return type.
+    try:
+        raw_issue = _http_get_json(
+            f"{args.jira_base_url.rstrip('/')}/rest/api/3/issue/{issue_key}",
+            headers={
+                "Authorization": _jira_basic_auth_header(jira_email, jira_token),
+                "Accept": "application/json",
+            },
+        )
+        raw_fields = raw_issue.get("fields", {}) if isinstance(raw_issue, dict) else {}
+        labels = raw_fields.get("labels")
+        if not isinstance(labels, list):
+            labels = []
+        cleaned = [str(x) for x in labels if isinstance(x, str) and x.strip()]
+        has_bugbot = any(l.lower() == BUGBOT_JIRA_LABEL.lower() for l in cleaned)
+        if not has_bugbot:
+            new_labels = cleaned + [BUGBOT_JIRA_LABEL]
+            _log(f"Adding Jira label {BUGBOT_JIRA_LABEL!r} to {issue_key}...")
+            update_jira_issue_fields(
+                jira_base_url=args.jira_base_url,
+                issue_key=issue_key,
+                email=jira_email,
+                api_token=jira_token,
+                fields_payload={"labels": new_labels},
+            )
+            _log("Jira label added.")
+    except Exception as e:
+        _log(f"WARNING: failed to ensure Jira label {BUGBOT_JIRA_LABEL!r}: {e}")
+
     prompt = build_cursor_prompt(issue)
 
-    if not args.non_interactive and sys.stdin.isatty():
+    # Default: headless. Opt-in to interactive.
+    if args.interactive and sys.stdin.isatty():
         _log(f"Running cursor-agent in PTY interactive mode in {repo_dir} (stdin forwarded).")
         output, returncode = _run_cursor_agent_with_pty_capture(
             prompt=prompt,
@@ -1486,9 +1619,74 @@ def main(argv: Optional[list[str]] = None) -> int:
             repo_dir=repo_dir,
             cursor_log_file=cursor_log_file,
             timeout_seconds=args.cursor_timeout_seconds,
+            retries=args.cursor_retries,
             cursor_bin=args.cursor_bin,
         )
-    runner_output = extract_runner_output_from_text(output)
+    allowed_rca_lines = textwrap.dedent(
+        """
+        - Requirement gaps
+        - Incorrect logic implementation
+        - Missing edge case handling
+        - Incomplete or invalid input validation
+        - Async / timing / race condition
+        - API misuse or faulty integration
+        - Unhandled null / undefined values
+        - Code merge conflict or overwrite
+        - State management issue
+        - Refactoring side effect
+        - Lack of unit test coverage
+        - Other
+        """
+    ).strip()
+
+    def reask_cursor_for_full_block(*, reason: str) -> str:
+        _log(f"{reason} Re-asking Cursor once to emit the full block.")
+        followup_prompt = textwrap.dedent(
+            f"""
+            Your previous response was invalid.
+
+            Requirements:
+            - Output ONLY the full machine-parseable block below (nothing else).
+            - RCA MUST be EXACTLY one of the allowed values listed.
+            - If you need to say something else, set RCA: Other and put details in RCA_COMMENTS.
+
+            Allowed RCA values (pick exactly one):
+            {allowed_rca_lines}
+
+            RUNNER_OUTPUT_BEGIN
+            COMMIT_NAME: <your proposed commit message>
+            WHAT_DID_I_WORK_ON_DEV: <...>
+            WHAT_DID_I_WORK_ON_TECH_PM: <...>
+            WHAT_DID_I_WORK_ON_NON_TECH_PM: <...>
+            WHAT_MIGHT_BE_IMPACTED: <...>
+            RCA: <one of the allowed values>
+            RCA_COMMENTS: <required; may be empty after colon>
+            SPECS_STATUS: <must be EXACTLY one of: OK; FAILED; NOT_RUN>
+            SPECS_DETAILS: <required; include the spec command(s) you ran; if FAILED include brief failure; if NOT_RUN include why>
+            RUNNER_OUTPUT_END
+            """
+        ).strip() + "\n"
+        return run_cursor_agent_capture_output(
+            prompt=followup_prompt,
+            repo_dir=repo_dir,
+            cursor_log_file=cursor_log_file,
+            timeout_seconds=args.cursor_timeout_seconds,
+            retries=args.cursor_retries,
+            cursor_bin=args.cursor_bin,
+        )
+
+    try:
+        runner_output = extract_runner_output_from_text(output)
+    except RuntimeError as e:
+        msg = str(e)
+        if "Missing required runner output fields" in msg:
+            output2 = reask_cursor_for_full_block(reason="Runner output missing required fields.")
+            runner_output = extract_runner_output_from_text(output2)
+        elif "Runner output RCA was not one of the allowed values" in msg:
+            output2 = reask_cursor_for_full_block(reason="Runner output RCA invalid.")
+            runner_output = extract_runner_output_from_text(output2)
+        else:
+            raise
 
     print("\nRUNNER OUTPUT (from Cursor):")
     print(f"COMMIT_NAME: {runner_output.commit_name}")
@@ -1497,7 +1695,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"WHAT_DID_I_WORK_ON_NON_TECH_PM: {runner_output.what_did_i_work_on_non_tech_pm}")
     print(f"WHAT_MIGHT_BE_IMPACTED: {runner_output.what_might_be_impacted}")
     print(f"RCA: {runner_output.rca}")
-    print(f"RCA_COMMENTS: {runner_output.rca_comments}")
+    print(f"SPECS_STATUS: {runner_output.specs_status}")
+    print(f"SPECS_DETAILS: {runner_output.specs_details}")
 
     if not args.no_jira_field_update:
         jira_instructions_raw = _read_text_if_exists(JIRA_INSTRUCTIONS_PATH)
@@ -1542,6 +1741,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             issue_key=issue_key,
             commit_name_from_cursor=runner_output.commit_name,
             preexisting_untracked=preexisting_untracked,
+            create_pr=not args.redo_pr,
         )
     except PrCreationError as e:
         pr_create_failed = True
