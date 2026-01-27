@@ -16,116 +16,77 @@ Then the script will:
 from __future__ import annotations
 
 import argparse
-import base64
 import datetime
-import errno
 import json
 import os
 import re
-import select
 import subprocess
 import sys
 import textwrap
-import termios
-import threading
 import time
-import tty
-import urllib.error
-import urllib.request
-from dataclasses import dataclass
 from typing import Any, Optional
 
 
-BUGBOT_FILES_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_JIRA_BASE_URL = "https://labguru.atlassian.net"
-DEFAULT_PROJECT_PREFIX = "LAB"
-DEFAULT_REPO_DIR = "/Users/jonathaneshel/Desktop/Code/Labguru"
-DEFAULT_CURSOR_LOG_FILE = os.path.join(BUGBOT_FILES_DIR, "logs", "last_cursor_agent.log")
-DEBUG_NDJSON_LOG_PATH = os.path.join(BUGBOT_FILES_DIR, ".cursor", "debug.log")
-DEBUG_RUN_ID = f"run-{int(time.time())}"
-BUGBOT_JIRA_LABEL = "BugBot"
-
-PLAN_MD_PATH = os.path.join(BUGBOT_FILES_DIR, "PLAN.md")
-API_RULES_MD_PATH = os.path.join(BUGBOT_FILES_DIR, "api summary.md")
-BUGBOT_TEACHER_CURSORRULES_PATH = (
-    "/Users/jonathaneshel/Desktop/Code/DS/app/services/protocol_converter/.cursorrules"
+from runner.constants import (
+    API_RULES_MD_PATH,
+    BUGBOT_TEACHER_CURSORRULES_PATH,
+    DEFAULT_CURSOR_LOG_FILE,
+    DEFAULT_JIRA_BASE_URL,
+    DEFAULT_PROJECT_PREFIX,
+    DEFAULT_REPO_DIR,
+    DEFAULT_RUNNER_OUTPUT_JSON_FILE,
+    JIRA_INSTRUCTIONS_PATH,
+    PLAN_MD_PATH,
 )
-JIRA_INSTRUCTIONS_PATH = os.path.join(BUGBOT_FILES_DIR, "JIRA_INSTRUCTIONS")
-_JIRA_FIELDS_JSON_BEGIN = "[JIRA_FIELDS_JSON]"
-_JIRA_FIELDS_JSON_END = "[/JIRA_FIELDS_JSON]"
-
-REVIEW_CONTEXT_DIR = os.path.join(BUGBOT_FILES_DIR, "review_context")
-MAX_REVIEW_CONTEXT_DESCRIPTION_CHARS = 8000
-MAX_REVIEW_CONTEXT_DIFF_CHARS = 12000
-
-
-@dataclass(frozen=True)
-class JiraIssue:
-    key: str
-    url: str
-    summary: str
-    issue_type: str
-    priority: str
-    description_text: str
-
-
-@dataclass(frozen=True)
-class RunnerOutput:
-    commit_name: str
-    what_did_i_work_on_dev: str
-    what_did_i_work_on_tech_pm: str
-    what_did_i_work_on_non_tech_pm: str
-    what_might_be_impacted: str
-    rca: str
-    # Optional; not required in RUNNER_OUTPUT anymore.
-    rca_comments: str
-    specs_status: str
-    specs_details: str
+from runner.logging import _debug_log, _log, _write_log_line
+from runner.jira import (
+    _format_for_jira,
+    _parse_jira_instructions,
+    _runner_output_value,
+    ensure_bugbot_label,
+    fetch_jira_issue,
+    update_jira_issue_fields,
+)
+from runner.git_ops import (
+    _ensure_on_ticket_branch,
+    _git_current_branch,
+    _git_untracked_files,
+    _run_cmd,
+    run_git_commit_push_and_pr,
+    run_karamba_new_in_repo,
+)
+from runner.cursor_agent import run_cursor_for_runner_output
+from runner.review_context import write_pr_review_context_file
+from runner.types import JiraIssue, PrCreationError, RunnerOutput
+from runner import cursor_agent as _cursor_agent
 
 
-class PrCreationError(RuntimeError):
-    def __init__(self, message: str, *, output: str) -> None:
-        super().__init__(message)
-        self.output = output
-
-
-def _log(message: str) -> None:
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[ticket_runner {ts}] {message}", file=sys.stderr, flush=True)
-
-# #region agent log (debug ndjson)
-def _debug_log(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
+def _write_runner_output_json(*, path: str, issue_key: str, runner_output: RunnerOutput) -> None:
     """
-    NDJSON debug log (no secrets).
-    Writes to /Users/jonathaneshel/Desktop/Code/bugbot files/.cursor/debug.log
+    Persist the parsed RunnerOutput so other scripts (e.g. Jira updater) can reuse it
+    without calling cursor-agent again.
     """
-    try:
-        payload = {
-            "sessionId": "debug-session",
-            "runId": DEBUG_RUN_ID,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        os.makedirs(os.path.dirname(DEBUG_NDJSON_LOG_PATH), exist_ok=True)
-        with open(DEBUG_NDJSON_LOG_PATH, "ab") as f:
-            f.write(json.dumps(payload).encode("utf-8", errors="replace") + b"\n")
-    except Exception:
-        # Never crash the script due to debug logging
-        pass
-
-# #endregion agent log (debug ndjson)
-
-def _write_log_line(log_fp: Optional[object], message: str) -> None:
-    if log_fp is None:
-        return
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        log_fp.write(f"[ticket_runner {ts}] {message}\n".encode("utf-8", errors="replace"))
-    except Exception:
-        pass
+    log_path = os.path.abspath(os.path.expanduser(path))
+    parent = os.path.dirname(log_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload = {
+        "issue_key": issue_key,
+        # Mirror the machine-parseable keys used in RUNNER_OUTPUT for stability.
+        "COMMIT_NAME": runner_output.commit_name,
+        "WHAT_DID_I_WORK_ON_DEV": runner_output.what_did_i_work_on_dev,
+        "WHAT_DID_I_WORK_ON_TECH_PM": runner_output.what_did_i_work_on_tech_pm,
+        "WHAT_DID_I_WORK_ON_NON_TECH_PM": runner_output.what_did_i_work_on_non_tech_pm,
+        "WHAT_MIGHT_BE_IMPACTED": runner_output.what_might_be_impacted,
+        "RCA": runner_output.rca,
+        "RCA_COMMENTS": runner_output.rca_comments,
+        "SPECS_STATUS": runner_output.specs_status,
+        "SPECS_DETAILS": runner_output.specs_details,
+    }
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+    _log(f"Wrote runner output JSON: {log_path}")
 
 
 def _read_text(path: str) -> str:
@@ -139,312 +100,6 @@ def _read_text_if_exists(path: str) -> str:
             return f.read()
     except FileNotFoundError:
         return ""
-
-
-def _parse_jira_instructions(raw: str) -> tuple[str, dict[str, Any]]:
-    """
-    Returns (prompt_instructions_text, config_dict).
-    Config is optional; if absent/invalid, returns {}.
-    """
-    text = (raw or "").strip()
-    if not text:
-        return "", {}
-
-    m = re.search(
-        re.escape(_JIRA_FIELDS_JSON_BEGIN) + r"([\s\S]*?)" + re.escape(_JIRA_FIELDS_JSON_END),
-        text,
-    )
-    if not m:
-        return text, {}
-
-    json_block = (m.group(1) or "").strip()
-    prompt_text = (text[: m.start()] + "\n" + text[m.end() :]).strip()
-
-    if not json_block:
-        return prompt_text, {}
-
-    try:
-        cfg = json.loads(json_block)
-        if isinstance(cfg, dict):
-            return prompt_text, cfg
-    except Exception:
-        pass
-
-    return prompt_text, {}
-
-def _truncate(s: str, max_chars: int) -> str:
-    s = (s or "").strip()
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars].rstrip() + "\n\n(TRUNCATED)"
-
-
-def _safe_filename_component(s: str) -> str:
-    """
-    Conservative filename sanitization (cross-platform-ish).
-    Keeps letters/numbers/._- and replaces everything else with '-'.
-    """
-    s = (s or "").strip()
-    s = s.replace(os.sep, "-")
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-") or "unknown"
-
-
-def _allocate_review_context_path(*, ticket_number: str) -> str:
-    """
-    Returns a non-existing path under REVIEW_CONTEXT_DIR.
-    Base filename: <ticket_number>.md; if exists, append __2, __3, ...
-    """
-    os.makedirs(REVIEW_CONTEXT_DIR, exist_ok=True)
-    ticket_part = _safe_filename_component(ticket_number)
-    base = os.path.join(REVIEW_CONTEXT_DIR, f"{ticket_part}.md")
-    if not os.path.exists(base):
-        return base
-    i = 2
-    while True:
-        candidate = os.path.join(REVIEW_CONTEXT_DIR, f"{ticket_part}__{i}.md")
-        if not os.path.exists(candidate):
-            return candidate
-        i += 1
-
-
-def _parse_pr_url_from_karamba_output(text: str) -> Optional[str]:
-    """
-    Prefer the canonical karamba success line:
-      Pull request created: https://...
-    Fall back to first URL in output.
-    """
-    raw = text or ""
-    for line in raw.splitlines():
-        m = re.search(r"^\s*Pull request created:\s*(https?://\S+)\s*$", line.strip())
-        if m:
-            return m.group(1).strip().rstrip(").,]")
-    m2 = re.search(r"https?://\S+", raw)
-    if m2:
-        return m2.group(0).strip().rstrip(").,]")
-    return None
-
-
-def _git_origin_head_branch(repo_dir: str) -> str:
-    """
-    Returns something like 'main' from 'origin/main' by reading origin/HEAD.
-    Falls back to 'main' if not available.
-    """
-    res = _run_cmd(
-        cmd=["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
-        cwd=repo_dir,
-        capture_output=True,
-        check=False,
-    )
-    val = (res.stdout or "").strip()
-    if val.startswith("origin/"):
-        candidate = val[len("origin/") :].strip()
-        if candidate:
-            return candidate
-    return "main"
-
-
-def _read_karamba_env(repo_dir: str) -> dict[str, str]:
-    """
-    Reads a simple KEY=VALUE file from <repo_dir>/.karamba.
-    Values may be quoted. Unknown/invalid lines are ignored.
-    """
-    path = os.path.join(repo_dir, ".karamba")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.read().splitlines()
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        return {}
-
-    env: dict[str, str] = {}
-    for raw in lines:
-        line = (raw or "").strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, val = line.split("=", 1)
-        key = (key or "").strip()
-        val = (val or "").strip()
-        if not key:
-            continue
-        # Strip optional surrounding quotes
-        if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
-            val = val[1:-1]
-        env[key] = val
-    return env
-
-
-def _default_pr_base_branch(repo_dir: str) -> tuple[str, str]:
-    """
-    Best-effort: choose the branch that PRs are typically opened against.
-    Prefer .karamba STAGING_BRANCH (git_flow), else MAIN_BRANCH, else origin/HEAD-derived.
-    Returns (branch_name, source_note).
-    """
-    cfg = _read_karamba_env(repo_dir)
-    staging = (cfg.get("STAGING_BRANCH") or "").strip()
-    if staging:
-        return staging, "from .karamba STAGING_BRANCH"
-    main = (cfg.get("MAIN_BRANCH") or "").strip()
-    if main:
-        return main, "from .karamba MAIN_BRANCH"
-    return _git_origin_head_branch(repo_dir), "from origin/HEAD"
-
-
-def _resolve_base_ref(repo_dir: str, base_branch: str) -> tuple[str, str]:
-    """
-    Resolve a base branch name into an existing ref we can diff against.
-    Prefers origin/<branch>, then local <branch>. Falls back to origin/HEAD-derived.
-    Returns (base_ref, note) where base_ref is like 'origin/staging' or 'staging'.
-    """
-    base_branch = (base_branch or "").strip()
-    if not base_branch:
-        base_branch, src = _default_pr_base_branch(repo_dir)
-    else:
-        src = "provided"
-
-    origin_ref = f"refs/remotes/origin/{base_branch}"
-    local_ref = f"refs/heads/{base_branch}"
-
-    has_origin = _run_cmd(
-        cmd=["git", "show-ref", "--verify", "--quiet", origin_ref],
-        cwd=repo_dir,
-        capture_output=True,
-        check=False,
-    ).returncode == 0
-    if has_origin:
-        return f"origin/{base_branch}", src
-
-    has_local = _run_cmd(
-        cmd=["git", "show-ref", "--verify", "--quiet", local_ref],
-        cwd=repo_dir,
-        capture_output=True,
-        check=False,
-    ).returncode == 0
-    if has_local:
-        return base_branch, src
-
-    fallback, fallback_src = _default_pr_base_branch(repo_dir)
-    # If that fallback is also missing, we still return origin/<fallback> (git diff will just be empty/error,
-    # but the packet will include the chosen base for debugging).
-    return f"origin/{fallback}", f"fallback ({fallback_src})"
-
-
-def write_pr_review_context_file(
-    *,
-    ticket_number: str,
-    repo_dir: str,
-    issue: "JiraIssue",
-    runner_output: "RunnerOutput",
-    pr_url: Optional[str],
-    pr_create_output: str,
-    pr_create_failed: bool,
-) -> str:
-    os.makedirs(REVIEW_CONTEXT_DIR, exist_ok=True)
-
-    branch = _git_current_branch(repo_dir)
-    path = _allocate_review_context_path(ticket_number=ticket_number)
-
-    head_sha_res = _run_cmd(
-        cmd=["git", "rev-parse", "HEAD"],
-        cwd=repo_dir,
-        capture_output=True,
-        check=False,
-    )
-    head_sha = (head_sha_res.stdout or "").strip() if head_sha_res.returncode == 0 else "(unknown)"
-
-    base_branch, base_branch_source = _default_pr_base_branch(repo_dir)
-    base_ref, base_ref_source = _resolve_base_ref(repo_dir, base_branch)
-    diff_range = f"{base_ref}...HEAD"
-
-    name_status = _run_cmd(
-        cmd=["git", "diff", "--name-status", diff_range],
-        cwd=repo_dir,
-        capture_output=True,
-        check=False,
-    ).stdout or ""
-
-    diff_stat = _run_cmd(
-        cmd=["git", "diff", "--stat", diff_range],
-        cwd=repo_dir,
-        capture_output=True,
-        check=False,
-    ).stdout or ""
-
-    patch = _run_cmd(
-        cmd=["git", "diff", diff_range],
-        cwd=repo_dir,
-        capture_output=True,
-        check=False,
-    ).stdout or ""
-    patch = _truncate(patch, MAX_REVIEW_CONTEXT_DIFF_CHARS)
-
-    description = _truncate(issue.description_text or "(No Jira description provided)", MAX_REVIEW_CONTEXT_DESCRIPTION_CHARS)
-    pr_create_output = (pr_create_output or "").strip()
-    pr_status = "not created" if pr_create_failed else (pr_url or "(unknown)")
-
-    generated_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    md = textwrap.dedent(
-        f"""
-        # PR Review Context — {issue.key}
-
-        Generated: {generated_at}
-        Repo: {repo_dir}
-        Branch: {branch}
-        HEAD: {head_sha}
-        Base branch: {base_branch} ({base_branch_source})
-        Base ref used: {base_ref} ({base_ref_source})
-        Diff range: {diff_range}
-        PR: {pr_status}
-
-        ## Ticket
-        - Key: {issue.key}
-        - URL: {issue.url}
-        - Summary: {issue.summary}
-        - Type: {issue.issue_type}
-        - Priority: {issue.priority}
-
-        ### Jira description (truncated)
-        {description}
-
-        ## Implementation summary (from Cursor RUNNER_OUTPUT)
-        - COMMIT_NAME: {runner_output.commit_name}
-        - WHAT_DID_I_WORK_ON_DEV: {runner_output.what_did_i_work_on_dev}
-        - WHAT_DID_I_WORK_ON_TECH_PM: {runner_output.what_did_i_work_on_tech_pm}
-        - WHAT_DID_I_WORK_ON_NON_TECH_PM: {runner_output.what_did_i_work_on_non_tech_pm}
-        - WHAT_MIGHT_BE_IMPACTED: {runner_output.what_might_be_impacted}
-        - RCA: {runner_output.rca}
-        - RCA_COMMENTS: {runner_output.rca_comments}
-
-        ## Changed files
-        ```
-        {name_status.strip()}
-        ```
-
-        ## Diff stat
-        ```
-        {diff_stat.strip()}
-        ```
-
-        ## Patch (truncated)
-        ```diff
-        {patch.strip()}
-        ```
-
-        ## PR creation output
-        PR creation failed: {str(bool(pr_create_failed))}
-        ```
-        {pr_create_output}
-        ```
-
-        ## When replying to review comments
-        - Paste the unresolved review thread(s) here (comment text + file:line).
-        - Then ask Cursor: \"Address these comments with the minimal change; update tests if needed.\"
-        """
-    ).strip() + "\n"
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(md)
-    return path
 
 
 def _extract_ticket_number(raw: str) -> str:
@@ -462,187 +117,11 @@ def _extract_ticket_number(raw: str) -> str:
     return m.group(1)
 
 
-def _adf_text(node: Any) -> str:
-    """
-    Best-effort conversion of Jira ADF (Atlassian Document Format) to plain text.
-    Keeps it simple: collects 'text' nodes and adds newlines around paragraphs.
-    """
-    if node is None:
-        return ""
-
-    if isinstance(node, str):
-        return node
-
-    if isinstance(node, list):
-        return "".join(_adf_text(x) for x in node)
-
-    if isinstance(node, dict):
-        node_type = node.get("type")
-        if "text" in node and isinstance(node["text"], str):
-            return node["text"]
-
-        content = node.get("content")
-        inner = _adf_text(content) if content is not None else ""
-
-        if node_type in {"paragraph", "heading", "blockquote", "codeBlock"}:
-            inner = inner.strip()
-            return (inner + "\n\n") if inner else ""
-
-        if node_type in {"listItem"}:
-            inner = inner.strip()
-            return (f"- {inner}\n") if inner else ""
-
-        if node_type in {"bulletList", "orderedList"}:
-            return inner + ("\n" if inner and not inner.endswith("\n") else "")
-
-        return inner
-
-    return ""
-
-
-def _jira_basic_auth_header(email: str, api_token: str) -> str:
-    raw = f"{email}:{api_token}".encode("utf-8")
-    b64 = base64.b64encode(raw).decode("ascii")
-    return f"Basic {b64}"
-
-
-def _runner_output_value(ro: RunnerOutput, key: str) -> str:
-    table = {
-        "WHAT_DID_I_WORK_ON_DEV": ro.what_did_i_work_on_dev,
-        "WHAT_DID_I_WORK_ON_TECH_PM": ro.what_did_i_work_on_tech_pm,
-        "WHAT_DID_I_WORK_ON_NON_TECH_PM": ro.what_did_i_work_on_non_tech_pm,
-        "WHAT_MIGHT_BE_IMPACTED": ro.what_might_be_impacted,
-        "RCA": ro.rca,
-        "RCA_COMMENTS": ro.rca_comments,
-        "COMMIT_NAME": ro.commit_name,
-    }
-    if key not in table:
-        raise RuntimeError(f"Unknown runner output key in JIRA_INSTRUCTIONS config: {key}")
-    return table[key] or ""
-
-
-def _format_for_jira(value: str, fmt: str, *, append_value: str = "") -> Any:
-    """
-    Returns a value suitable for Jira 'fields' payload.
-    We keep it simple: send plain strings. (If your Jira fields require ADF, we can extend this.)
-    """
-    v = (value or "").strip()
-    a = (append_value or "").strip()
-    fmt = (fmt or "as_is").strip()
-
-    if fmt == "bullets":
-        # Input is usually "a; b; c" → "- a\n- b\n- c"
-        parts = [p.strip() for p in v.split(";") if p.strip()]
-        v = "\n".join([f"- {p}" for p in parts]) if parts else v
-
-    if fmt == "rca_with_comments":
-        if a:
-            return f"{v}\n\n{a}".strip()
-        return v
-
-    # default: as-is (optionally append)
-    return (v + ("\n" + a if a else "")).strip()
-
-
-def update_jira_issue_fields(
-    *,
-    jira_base_url: str,
-    issue_key: str,
-    email: str,
-    api_token: str,
-    fields_payload: dict[str, Any],
-) -> None:
-    api_url = f"{jira_base_url.rstrip('/')}/rest/api/3/issue/{issue_key}"
-    body = json.dumps({"fields": fields_payload}).encode("utf-8")
-
-    req = urllib.request.Request(
-        api_url,
-        data=body,
-        method="PUT",
-        headers={
-            "Authorization": _jira_basic_auth_header(email, api_token),
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        },
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            _ = resp.read()
-    except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        raise RuntimeError(f"Jira update failed ({e.code}) for {api_url}. Details: {detail}") from e
-
-
-def _http_get_json(url: str, headers: dict[str, str]) -> Any:
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        body = resp.read().decode("utf-8")
-    return json.loads(body)
-
-
-def fetch_jira_issue(
-    *,
-    jira_base_url: str,
-    project_prefix: str,
-    ticket_number: str,
-    email: str,
-    api_token: str,
-) -> JiraIssue:
-    key = f"{project_prefix}-{ticket_number}"
-    browse_url = f"{jira_base_url.rstrip('/')}/browse/{key}"
-    api_url = f"{jira_base_url.rstrip('/')}/rest/api/3/issue/{key}"
-
-    headers = {
-        "Accept": "application/json",
-        "Authorization": _jira_basic_auth_header(email, api_token),
-    }
-
-    try:
-        issue = _http_get_json(api_url, headers=headers)
-    except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"Jira API request failed ({e.code}) for {api_url}. Details: {detail}"
-        ) from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Jira API request failed for {api_url}: {e}") from e
-
-    fields = issue.get("fields", {}) if isinstance(issue, dict) else {}
-    summary = str(fields.get("summary") or "").strip()
-    issue_type = str((fields.get("issuetype") or {}).get("name") or "").strip()
-    priority = str((fields.get("priority") or {}).get("name") or "").strip()
-    description = fields.get("description")
-    description_text = _adf_text(description).strip()
-
-    return JiraIssue(
-        key=key,
-        url=browse_url,
-        summary=summary,
-        issue_type=issue_type,
-        priority=priority,
-        description_text=description_text,
-    )
-
-
 def run_karamba_new(ticket_number: str) -> None:
     run_karamba_new_in_repo(
         issue_key=f"{DEFAULT_PROJECT_PREFIX}-{ticket_number}",
         repo_dir=DEFAULT_REPO_DIR,
     )
-
-
-def run_karamba_new_in_repo(*, issue_key: str, repo_dir: str) -> None:
-    subprocess.run(["karamba", "new", issue_key], check=True, cwd=repo_dir)
-
 
 def build_cursor_prompt(issue: JiraIssue) -> str:
     plan_md = _read_text(PLAN_MD_PATH)
@@ -808,7 +287,7 @@ def _prepare_cursor_invocation(*, prompt: str, cursor_bin: str) -> tuple[list[st
     Returns (cmd, effective_prompt) for a single attempt.
     Always uses `/plan` embedded in the prompt (this Cursor CLI does not support `--mode`).
     """
-    return [cursor_bin], "/plan\n\n" + prompt
+    return _cursor_agent._prepare_cursor_invocation(prompt=prompt, cursor_bin=cursor_bin)
 
 
 def _run_cursor_agent_with_pty_capture(
@@ -823,6 +302,13 @@ def _run_cursor_agent_with_pty_capture(
     Runs cursor-agent connected to a PTY, forwarding stdin/stdout and capturing output.
     Returns (captured_output, returncode).
     """
+    return _cursor_agent._run_cursor_agent_with_pty_capture(
+        prompt=prompt,
+        repo_dir=repo_dir,
+        cursor_log_file=cursor_log_file,
+        heartbeat_seconds=heartbeat_seconds,
+        cursor_bin=cursor_bin,
+    )
     import pty
 
     cmd, effective_prompt = _prepare_cursor_invocation(prompt=prompt, cursor_bin=cursor_bin)
@@ -1114,6 +600,7 @@ def extract_commit_name_from_text(output: str) -> str:
     Strict: require a COMMIT_NAME line.
     We do NOT guess or fallback.
     """
+    return _cursor_agent.extract_commit_name_from_text(output)
     for line in output.splitlines():
         if line.startswith("COMMIT_NAME:"):
             value = line[len("COMMIT_NAME:") :].strip()
@@ -1127,6 +614,7 @@ def extract_runner_output_from_text(output: str) -> RunnerOutput:
     """
     Strict: require the RUNNER_OUTPUT_BEGIN/END block and all required fields.
     """
+    return _cursor_agent.extract_runner_output_from_text(output)
     allowed_rca = {
         "Requirement gaps",
         "Incorrect logic implementation",
@@ -1212,164 +700,6 @@ def extract_runner_output_from_text(output: str) -> RunnerOutput:
     )
 
 
-def _run_cmd(
-    *,
-    cmd: list[str],
-    cwd: str,
-    check: bool = True,
-    capture_output: bool = False,
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        cmd,
-        cwd=cwd,
-        text=True,
-        check=check,
-        capture_output=capture_output,
-    )
-
-
-def _git_current_branch(repo_dir: str) -> str:
-    res = _run_cmd(
-        cmd=["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        cwd=repo_dir,
-        capture_output=True,
-    )
-    return (res.stdout or "").strip()
-
-
-def _sanitize_commit_message(raw: str) -> str:
-    # Git commit subject should be a single line; keep it robust against accidental newlines/ANSI.
-    msg = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw or "")  # strip common ANSI escapes
-    msg = msg.replace("\r", "\n").split("\n", 1)[0].strip()
-    if not msg:
-        raise RuntimeError("Commit message resolved to empty after sanitization.")
-    return msg
-
-
-def _ensure_git_repo(repo_dir: str) -> None:
-    res = _run_cmd(
-        cmd=["git", "rev-parse", "--is-inside-work-tree"],
-        cwd=repo_dir,
-        capture_output=True,
-        check=False,
-    )
-    if res.returncode != 0 or "true" not in (res.stdout or ""):
-        raise RuntimeError(f"Not a git repository: {repo_dir}")
-
-
-def _git_untracked_files(repo_dir: str) -> set[str]:
-    """
-    Returns a set of untracked file paths relative to repo root.
-    Uses NUL-separated porcelain for safe parsing.
-    """
-    res = _run_cmd(
-        cmd=["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-        cwd=repo_dir,
-        capture_output=True,
-        check=False,
-    )
-    out = res.stdout or ""
-    untracked: set[str] = set()
-    for entry in out.split("\0"):
-        if not entry:
-            continue
-        # Untracked entries look like: "?? path"
-        if entry.startswith("?? "):
-            path = entry[3:].strip()
-            if path:
-                untracked.add(path)
-    return untracked
-
-
-def _chunked(items: list[str], size: int) -> list[list[str]]:
-    if size <= 0:
-        return [items]
-    return [items[i : i + size] for i in range(0, len(items), size)]
-
-
-def run_git_commit_push_and_pr(
-    *,
-    repo_dir: str,
-    issue_key: str,
-    commit_name_from_cursor: str,
-    preexisting_untracked: Optional[set[str]] = None,
-    create_pr: bool = True,
-) -> tuple[Optional[str], str]:
-    _ensure_git_repo(repo_dir)
-
-    commit_message = _sanitize_commit_message(commit_name_from_cursor)
-    branch = _git_current_branch(repo_dir)
-    if not branch:
-        raise RuntimeError("Could not determine current git branch.")
-
-    if issue_key not in commit_message:
-        _log(
-            f"WARNING: commit message does not include {issue_key}. "
-            "Proceeding anyway (Cursor is the source of truth)."
-        )
-
-    if preexisting_untracked is None:
-        _log("Staging changes (git add -A)...")
-        _run_cmd(cmd=["git", "add", "-A"], cwd=repo_dir)
-    else:
-        _log("Staging changes (tracked changes + newly created files from this run)...")
-        # Tracked modifications/deletions:
-        _run_cmd(cmd=["git", "add", "-u"], cwd=repo_dir)
-
-        # Only stage untracked files that appeared during this run (avoid scooping up old junk).
-        post_untracked = _git_untracked_files(repo_dir)
-        new_untracked = sorted(post_untracked - preexisting_untracked)
-        if new_untracked:
-            _log(f"Staging {len(new_untracked)} newly created file(s) from this run...")
-            for chunk in _chunked(new_untracked, 100):
-                _run_cmd(cmd=["git", "add", "--", *chunk], cwd=repo_dir)
-
-    _log(f"Committing changes (git commit -m {commit_message!r})...")
-    commit_res = _run_cmd(
-        cmd=["git", "commit", "-m", commit_message],
-        cwd=repo_dir,
-        check=False,
-        capture_output=True,
-    )
-    if commit_res.returncode != 0:
-        stderr = (commit_res.stderr or "").strip()
-        stdout = (commit_res.stdout or "").strip()
-        # Common "nothing to commit" case: allow continuing to push/pr.
-        if "nothing to commit" in (stderr + "\n" + stdout).lower():
-            _log("No changes to commit (working tree clean). Continuing to push/PR.")
-        else:
-            raise RuntimeError(
-                "git commit failed.\n"
-                f"stdout:\n{stdout}\n\n"
-                f"stderr:\n{stderr}\n"
-            )
-
-    _log(f"Force pushing branch to origin (git push --force --set-upstream origin {branch})...")
-    _run_cmd(cmd=["git", "push", "--force", "--set-upstream", "origin", branch], cwd=repo_dir)
-
-    if not create_pr:
-        _log("Skipping PR creation (redo-pr mode).")
-        return None, ""
-
-    _log(f"Creating PR via karamba (karamba pr {issue_key})...")
-    pr_res = _run_cmd(
-        cmd=["karamba", "pr", issue_key],
-        cwd=repo_dir,
-        check=False,
-        capture_output=True,
-    )
-    pr_out = ((pr_res.stdout or "") + "\n" + (pr_res.stderr or "")).strip()
-    if pr_res.returncode != 0:
-        raise PrCreationError("karamba pr failed.", output=pr_out)
-
-    pr_url = _parse_pr_url_from_karamba_output(pr_out)
-    if pr_url:
-        _log(f"Detected PR URL: {pr_url}")
-    else:
-        _log("Could not detect PR URL from karamba output (continuing).")
-    return pr_url, pr_out
-
-
 def run_cursor_agent_capture_output(
     *,
     prompt: str,
@@ -1383,6 +713,14 @@ def run_cursor_agent_capture_output(
     Non-interactive capture. This is primarily used to get the COMMIT_NAME line.
     If Cursor needs interactive clarifications, prefer the interactive runner.
     """
+    return _cursor_agent.run_cursor_agent_capture_output(
+        prompt=prompt,
+        repo_dir=repo_dir,
+        cursor_log_file=cursor_log_file,
+        timeout_seconds=timeout_seconds,
+        retries=retries,
+        cursor_bin=cursor_bin,
+    )
     cmd, effective_prompt = _prepare_cursor_invocation(prompt=prompt, cursor_bin=cursor_bin)
     # #region agent log (debug ndjson)
     _debug_log(
@@ -1508,6 +846,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Retries for transient cursor-agent failures (e.g., 'Connection stalled').",
     )
     parser.add_argument(
+        "--runner-output-json",
+        default=DEFAULT_RUNNER_OUTPUT_JSON_FILE,
+        help=f"Write parsed RUNNER_OUTPUT fields to this JSON file (default: {DEFAULT_RUNNER_OUTPUT_JSON_FILE}).",
+    )
+    parser.add_argument(
         "--no-jira-field-update",
         action="store_true",
         help="Disable updating Jira fields from JIRA_INSTRUCTIONS (even if configured).",
@@ -1526,7 +869,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--redo-pr",
         action="store_true",
         help="Redo an existing PR: do NOT run karamba new and do NOT run karamba pr. "
-        "Assumes you already checked out the PR branch locally; will run Cursor, commit, and force-push.",
+        "Will auto-checkout the ticket branch (by searching local/remote branches for the issue key) "
+        "and then run Cursor, commit, and force-push.",
     )
 
     args = parser.parse_args(argv)
@@ -1549,7 +893,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"Starting work: karamba new {issue_key}")
         run_karamba_new_in_repo(issue_key=issue_key, repo_dir=repo_dir)
     else:
-        _log("redo-pr mode enabled: skipping karamba new; operating on current git branch.")
+        _log("redo-pr mode enabled: ensuring we are on the correct ticket branch...")
+        _ensure_on_ticket_branch(repo_dir=repo_dir, issue_key=issue_key)
 
     # Snapshot untracked files BEFORE cursor-agent runs, so we don't accidentally add pre-existing
     # untracked artifacts from the developer machine into the PR.
@@ -1568,125 +913,35 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"URL: {issue.url}")
 
     # Ensure the ticket is labeled so it’s easy to find BugBot-handled tickets.
-    # fetch_jira_issue returns a JiraIssue dataclass; we need labels from the raw issue JSON.
-    # We re-fetch once (cheap) to avoid changing fetch_jira_issue’s return type.
-    try:
-        raw_issue = _http_get_json(
-            f"{args.jira_base_url.rstrip('/')}/rest/api/3/issue/{issue_key}",
-            headers={
-                "Authorization": _jira_basic_auth_header(jira_email, jira_token),
-                "Accept": "application/json",
-            },
-        )
-        raw_fields = raw_issue.get("fields", {}) if isinstance(raw_issue, dict) else {}
-        labels = raw_fields.get("labels")
-        if not isinstance(labels, list):
-            labels = []
-        cleaned = [str(x) for x in labels if isinstance(x, str) and x.strip()]
-        has_bugbot = any(l.lower() == BUGBOT_JIRA_LABEL.lower() for l in cleaned)
-        if not has_bugbot:
-            new_labels = cleaned + [BUGBOT_JIRA_LABEL]
-            _log(f"Adding Jira label {BUGBOT_JIRA_LABEL!r} to {issue_key}...")
-            update_jira_issue_fields(
-                jira_base_url=args.jira_base_url,
-                issue_key=issue_key,
-                email=jira_email,
-                api_token=jira_token,
-                fields_payload={"labels": new_labels},
-            )
-            _log("Jira label added.")
-    except Exception as e:
-        _log(f"WARNING: failed to ensure Jira label {BUGBOT_JIRA_LABEL!r}: {e}")
+    # Best-effort; failures are warnings only.
+    ensure_bugbot_label(
+        jira_base_url=args.jira_base_url,
+        issue_key=issue_key,
+        email=jira_email,
+        api_token=jira_token,
+    )
 
     prompt = build_cursor_prompt(issue)
-
-    # Default: headless. Opt-in to interactive.
-    if args.interactive and sys.stdin.isatty():
-        _log(f"Running cursor-agent in PTY interactive mode in {repo_dir} (stdin forwarded).")
-        output, returncode = _run_cursor_agent_with_pty_capture(
-            prompt=prompt,
-            repo_dir=repo_dir,
-            cursor_log_file=cursor_log_file,
-            heartbeat_seconds=args.heartbeat_seconds,
-            cursor_bin=args.cursor_bin,
-        )
-        if returncode != 0:
-            raise RuntimeError("cursor-agent failed (see output above).")
-    else:
-        _log(f"Running cursor-agent headlessly in {repo_dir} (no human input).")
-        output = run_cursor_agent_capture_output(
-            prompt=prompt,
-            repo_dir=repo_dir,
-            cursor_log_file=cursor_log_file,
-            timeout_seconds=args.cursor_timeout_seconds,
-            retries=args.cursor_retries,
-            cursor_bin=args.cursor_bin,
-        )
-    allowed_rca_lines = textwrap.dedent(
-        """
-        - Requirement gaps
-        - Incorrect logic implementation
-        - Missing edge case handling
-        - Incomplete or invalid input validation
-        - Async / timing / race condition
-        - API misuse or faulty integration
-        - Unhandled null / undefined values
-        - Code merge conflict or overwrite
-        - State management issue
-        - Refactoring side effect
-        - Lack of unit test coverage
-        - Other
-        """
-    ).strip()
-
-    def reask_cursor_for_full_block(*, reason: str) -> str:
-        _log(f"{reason} Re-asking Cursor once to emit the full block.")
-        followup_prompt = textwrap.dedent(
-            f"""
-            Your previous response was invalid.
-
-            Requirements:
-            - Output ONLY the full machine-parseable block below (nothing else).
-            - RCA MUST be EXACTLY one of the allowed values listed.
-            - If you need to say something else, set RCA: Other and put details in RCA_COMMENTS.
-
-            Allowed RCA values (pick exactly one):
-            {allowed_rca_lines}
-
-            RUNNER_OUTPUT_BEGIN
-            COMMIT_NAME: <your proposed commit message>
-            WHAT_DID_I_WORK_ON_DEV: <...>
-            WHAT_DID_I_WORK_ON_TECH_PM: <...>
-            WHAT_DID_I_WORK_ON_NON_TECH_PM: <...>
-            WHAT_MIGHT_BE_IMPACTED: <...>
-            RCA: <one of the allowed values>
-            RCA_COMMENTS: <required; may be empty after colon>
-            SPECS_STATUS: <must be EXACTLY one of: OK; FAILED; NOT_RUN>
-            SPECS_DETAILS: <required; include the spec command(s) you ran; if FAILED include brief failure; if NOT_RUN include why>
-            RUNNER_OUTPUT_END
-            """
-        ).strip() + "\n"
-        return run_cursor_agent_capture_output(
-            prompt=followup_prompt,
-            repo_dir=repo_dir,
-            cursor_log_file=cursor_log_file,
-            timeout_seconds=args.cursor_timeout_seconds,
-            retries=args.cursor_retries,
-            cursor_bin=args.cursor_bin,
-        )
+    runner_output, _ = run_cursor_for_runner_output(
+        prompt=prompt,
+        repo_dir=repo_dir,
+        cursor_log_file=cursor_log_file,
+        interactive=bool(args.interactive),
+        heartbeat_seconds=args.heartbeat_seconds,
+        timeout_seconds=args.cursor_timeout_seconds,
+        retries=args.cursor_retries,
+        cursor_bin=args.cursor_bin,
+    )
 
     try:
-        runner_output = extract_runner_output_from_text(output)
-    except RuntimeError as e:
-        msg = str(e)
-        if "Missing required runner output fields" in msg:
-            output2 = reask_cursor_for_full_block(reason="Runner output missing required fields.")
-            runner_output = extract_runner_output_from_text(output2)
-        elif "Runner output RCA was not one of the allowed values" in msg:
-            output2 = reask_cursor_for_full_block(reason="Runner output RCA invalid.")
-            runner_output = extract_runner_output_from_text(output2)
-        else:
-            raise
+        if str(args.runner_output_json or "").strip():
+            _write_runner_output_json(
+                path=args.runner_output_json,
+                issue_key=issue_key,
+                runner_output=runner_output,
+            )
+    except Exception as e:
+        _log(f"WARNING: failed to write runner output JSON: {e}")
 
     print("\nRUNNER OUTPUT (from Cursor):")
     print(f"COMMIT_NAME: {runner_output.commit_name}")
