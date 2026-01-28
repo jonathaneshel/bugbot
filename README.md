@@ -222,6 +222,12 @@ Natural language parsing:
 - If it ever guesses wrong, include an explicit ticket key like `LAB-1234` in your message to force it.
 - If you don’t provide a ticket, BugBot will answer as a **general Labguru main-branch** question.
 
+Auto-generate `review_context`:
+
+- If a ticket has no `review_context/*.md` yet, BugBot will try to generate it automatically by fetching Jira + GitHub PR data.
+- For best results, include the PR URL/number in your message (e.g., `PR 9135` or `https://github.com/BioData/Labguru/pull/9135`).
+- Required env vars for generation: `JIRA_EMAIL`, `JIRA_API_TOKEN`, `GITHUB_TOKEN` (and optionally `GITHUB_REPO`).
+
 It will:
 
 - Find the matching markdown file in `review_context/`
@@ -274,7 +280,7 @@ python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/slackbot.py"
 - `REVIEW_CONTEXT_DIR`: defaults to `/Users/jonathaneshel/Desktop/Code/bugbot files/review_context`
 - `LABGURU_REPO_DIR`: defaults to `/Users/jonathaneshel/Desktop/Code/Labguru` (where `cursor-agent` runs so it can read the repo if needed)
 - `LABGURU_MAIN_WORKTREE_DIR`: defaults to `/Users/jonathaneshel/Desktop/Code/bugbot files/.labguru_main_worktree` (a dedicated main-branch worktree used for ticket-less questions)
-- `LABGURU_MAIN_REF`: defaults to `origin/main` (ref used for the main worktree; set to `main` if you don’t have origin/main locally)
+- `LABGURU_MAIN_REF`: defaults to `main` (ref used for the main worktree)
 - `PROJECT_PREFIX`: defaults to `LAB`
 - `CURSOR_BIN`: defaults to `cursor-agent`
 - `CURSOR_MODEL`: defaults to `gpt-5.2-high`
@@ -289,5 +295,7 @@ python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/slackbot.py"
 - `SLACKBOT_SLOW_UPDATE_TEXT`: defaults to `Still working…`
 - `SLACKBOT_LOG_MESSAGE_CONTENT`: defaults to `0` (set to `1` to log user messages + answers to the terminal; redacted + truncated)
 - `SLACKBOT_LOG_CONTENT_MAX_CHARS`: defaults to `800`
+- `SLACKBOT_ERROR_LOG_PATH`: defaults to `/Users/jonathaneshel/Desktop/Code/bugbot files/logs/slackbot_errors.ndjson` (NDJSON file; one line per error response)
+- `SLACKBOT_ERROR_LOG_MAX_TURNS`: defaults to `12` (history entries stored in each error record)
 
 

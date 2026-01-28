@@ -52,10 +52,12 @@ from runner.git_ops import (
     _git_current_branch,
     _git_untracked_files,
     _run_cmd,
+    redo_pr_prepare_clean_slate,
+    redo_pr_restore_stash,
     run_git_commit_push_and_pr,
     run_karamba_new_in_repo,
 )
-from runner.cursor_agent import run_cursor_for_runner_output
+from runner.cursor_agent import ClarificationNeeded, run_cursor_for_runner_output
 from runner.review_context import write_pr_review_context_file
 from runner.types import JiraIssue, PrCreationError, RunnerOutput
 from runner import cursor_agent as _cursor_agent
@@ -893,14 +895,39 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"Starting work: karamba new {issue_key}")
         run_karamba_new_in_repo(issue_key=issue_key, repo_dir=repo_dir)
     else:
-        _log("redo-pr mode enabled: ensuring we are on the correct ticket branch...")
-        _ensure_on_ticket_branch(repo_dir=repo_dir, issue_key=issue_key)
+        _log("redo-pr mode enabled: preparing clean slate (stash -> reset -> clean) ...")
+        original_branch = ""
+        ticket_branch = ""
+        stashed = False
+        try:
+            original_branch, ticket_branch, stashed = redo_pr_prepare_clean_slate(
+                repo_dir=repo_dir,
+                issue_key=issue_key,
+            )
+        except Exception:
+            # If anything fails early, best-effort restore of stash (if created).
+            try:
+                redo_pr_restore_stash(
+                    repo_dir=repo_dir,
+                    original_branch=original_branch,
+                    ticket_branch=ticket_branch,
+                    stashed=stashed,
+                )
+            except Exception:
+                pass
+            raise
 
     # Snapshot untracked files BEFORE cursor-agent runs, so we don't accidentally add pre-existing
     # untracked artifacts from the developer machine into the PR.
     preexisting_untracked = _git_untracked_files(repo_dir)
 
-    print(f"Fetching Jira issue LAB-{ticket_number} ...")
+    # In headless mode, keep stdout clean so it can be reserved for machine-consumable content
+    # (e.g., clarification questions).
+    is_headless = bool(args.non_interactive) or not (args.interactive and sys.stdin.isatty())
+    if is_headless:
+        _log(f"Fetching Jira issue LAB-{ticket_number} ...")
+    else:
+        print(f"Fetching Jira issue LAB-{ticket_number} ...")
     issue = fetch_jira_issue(
         jira_base_url=args.jira_base_url,
         project_prefix=args.project_prefix,
@@ -909,8 +936,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         api_token=jira_token,
     )
 
-    print(f"Ticket: {issue.key} — {issue.summary}")
-    print(f"URL: {issue.url}")
+    if is_headless:
+        _log(f"Ticket: {issue.key} — {issue.summary}")
+        _log(f"URL: {issue.url}")
+    else:
+        print(f"Ticket: {issue.key} — {issue.summary}")
+        print(f"URL: {issue.url}")
 
     # Ensure the ticket is labeled so it’s easy to find BugBot-handled tickets.
     # Best-effort; failures are warnings only.
@@ -922,16 +953,32 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     prompt = build_cursor_prompt(issue)
-    runner_output, _ = run_cursor_for_runner_output(
-        prompt=prompt,
-        repo_dir=repo_dir,
-        cursor_log_file=cursor_log_file,
-        interactive=bool(args.interactive),
-        heartbeat_seconds=args.heartbeat_seconds,
-        timeout_seconds=args.cursor_timeout_seconds,
-        retries=args.cursor_retries,
-        cursor_bin=args.cursor_bin,
-    )
+    try:
+        runner_output, _ = run_cursor_for_runner_output(
+            prompt=prompt,
+            repo_dir=repo_dir,
+            cursor_log_file=cursor_log_file,
+            interactive=bool(args.interactive),
+            heartbeat_seconds=args.heartbeat_seconds,
+            timeout_seconds=args.cursor_timeout_seconds,
+            retries=args.cursor_retries,
+            cursor_bin=args.cursor_bin,
+        )
+    except ClarificationNeeded as e:
+        # Print ONLY the questions to stdout, then stop with a non-zero exit code.
+        # This allows wrappers (e.g., bugbot_pr_then_jira.py) to fail fast while capturing questions.
+        print(e.questions_text, end="")
+        if args.redo_pr:
+            try:
+                redo_pr_restore_stash(
+                    repo_dir=repo_dir,
+                    original_branch=locals().get("original_branch", ""),
+                    ticket_branch=locals().get("ticket_branch", ""),
+                    stashed=bool(locals().get("stashed", False)),
+                )
+            except Exception as restore_err:
+                _log(f"WARNING: failed to restore stash after clarification stop: {restore_err}")
+        return 3
 
     try:
         if str(args.runner_output_json or "").strip():
@@ -1016,6 +1063,16 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if pr_create_failed:
         raise PrCreationError("karamba pr failed (see PR creation output in context file).", output=pr_create_output)
+    if args.redo_pr:
+        try:
+            redo_pr_restore_stash(
+                repo_dir=repo_dir,
+                original_branch=locals().get("original_branch", ""),
+                ticket_branch=locals().get("ticket_branch", ""),
+                stashed=bool(locals().get("stashed", False)),
+            )
+        except Exception as e:
+            _log(f"WARNING: failed to restore stash after redo-pr: {e}")
     return 0
 
 

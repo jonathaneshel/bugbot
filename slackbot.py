@@ -12,6 +12,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -41,7 +43,7 @@ WORKERS = int(os.getenv("SLACKBOT_WORKERS", "4"))
 LABGURU_REPO_DIR = os.getenv("LABGURU_REPO_DIR", DEFAULT_LABGURU_REPO_DIR)
 DEFAULT_LABGURU_MAIN_WORKTREE_DIR = os.path.join(BUGBOT_FILES_DIR, ".labguru_main_worktree")
 LABGURU_MAIN_WORKTREE_DIR = os.getenv("LABGURU_MAIN_WORKTREE_DIR", DEFAULT_LABGURU_MAIN_WORKTREE_DIR)
-LABGURU_MAIN_REF = os.getenv("LABGURU_MAIN_REF", "origin/main")
+LABGURU_MAIN_REF = os.getenv("LABGURU_MAIN_REF", "main")
 
 DEFAULT_SESSIONS_PATH = os.path.join(BUGBOT_FILES_DIR, ".slackbot_sessions.json")
 SESSIONS_PATH = os.getenv("SLACKBOT_SESSIONS_PATH", DEFAULT_SESSIONS_PATH)
@@ -56,10 +58,26 @@ JIRA_API_TOKEN = (os.getenv("JIRA_API_TOKEN", "") or "").strip()
 
 GITHUB_TOKEN = (os.getenv("GITHUB_TOKEN", "") or "").strip()
 GITHUB_REPO = (os.getenv("GITHUB_REPO", DEFAULT_GITHUB_REPO) or DEFAULT_GITHUB_REPO).strip()
+GITHUB_API_BASE = os.getenv("GITHUB_API_BASE", "https://api.github.com").rstrip("/")
 
 DROP_EXACT_LINES = {"INSTRUCTIONS RECIEVED", "STARTED READING"}
 
 _EXECUTOR = ThreadPoolExecutor(max_workers=WORKERS)
+
+GIT_MODE_PREFIX_RE = re.compile(r"^\s*git\s+mode\b\s*[:\-]?\s*", re.IGNORECASE)
+
+
+def _extract_git_mode(*, question: str) -> tuple[bool, str]:
+    """
+    If the user starts their message with "GIT MODE", enable git-mode and strip the prefix.
+    """
+    q = (question or "").strip()
+    if not q:
+        return False, ""
+    q2 = GIT_MODE_PREFIX_RE.sub("", q, count=1).strip()
+    if q2 != q:
+        return True, q2
+    return False, q
 
 
 @dataclass(frozen=True)
@@ -74,6 +92,7 @@ class Session:
     github_repo: Optional[str]
     pr_number: Optional[int]
     pr_url: Optional[str]
+    git_mode_enabled: bool
     history: list[dict[str, str]]  # [{"role": "user"|"assistant", "text": "..."}]
     updated_at_ms: int
 
@@ -117,6 +136,9 @@ class SessionStore:
             pr_url = val.get("pr_url")
             if not isinstance(pr_url, str) or not pr_url.strip():
                 pr_url = None
+            git_mode_enabled = val.get("git_mode_enabled")
+            if not isinstance(git_mode_enabled, bool):
+                git_mode_enabled = False
             history = val.get("history")
             if not isinstance(history, list):
                 history = []
@@ -144,6 +166,7 @@ class SessionStore:
                 github_repo=github_repo,
                 pr_number=pr_number,
                 pr_url=pr_url,
+                git_mode_enabled=git_mode_enabled,
                 history=cleaned_history,
                 updated_at_ms=updated_at_ms,
             )
@@ -158,6 +181,7 @@ class SessionStore:
                     github_repo=None,
                     pr_number=None,
                     pr_url=None,
+                    git_mode_enabled=False,
                     history=[],
                     updated_at_ms=int(time.time() * 1000),
                 )
@@ -179,6 +203,7 @@ class SessionStore:
                         "github_repo": v.github_repo,
                         "pr_number": v.pr_number,
                         "pr_url": v.pr_url,
+                        "git_mode_enabled": v.git_mode_enabled,
                         "history": v.history,
                         "updated_at_ms": v.updated_at_ms,
                     }
@@ -203,6 +228,24 @@ class SessionStore:
 def _strip_ansi(s: str) -> str:
     return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", s or "")
 
+def _safe_filename_component(s: str) -> str:
+    s = (s or "").strip()
+    s = s.replace(os.sep, "-")
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-") or "unknown"
+
+def _allocate_review_context_path(*, ticket_key: str) -> str:
+    os.makedirs(REVIEW_CONTEXT_DIR, exist_ok=True)
+    ticket_part = _safe_filename_component(ticket_key)
+    base = os.path.join(REVIEW_CONTEXT_DIR, f"{ticket_part}.md")
+    if not os.path.exists(base):
+        return base
+    i = 2
+    while True:
+        candidate = os.path.join(REVIEW_CONTEXT_DIR, f"{ticket_part}__{i}.md")
+        if not os.path.exists(candidate):
+            return candidate
+        i += 1
+
 def _log_banner(log: logging.Logger, message: str) -> None:
     """
     Print a very visible log line. Uses ANSI bold so it stands out in terminals.
@@ -217,6 +260,10 @@ def _log_banner(log: logging.Logger, message: str) -> None:
 
 LOG_MESSAGE_CONTENT = os.getenv("SLACKBOT_LOG_MESSAGE_CONTENT", "0").strip() == "1"
 LOG_CONTENT_MAX_CHARS = int(os.getenv("SLACKBOT_LOG_CONTENT_MAX_CHARS", "800"))
+
+DEFAULT_ERROR_LOG_PATH = os.path.join(BUGBOT_FILES_DIR, "logs", "slackbot_errors.ndjson")
+ERROR_LOG_PATH = os.getenv("SLACKBOT_ERROR_LOG_PATH", DEFAULT_ERROR_LOG_PATH)
+ERROR_LOG_MAX_TURNS = int(os.getenv("SLACKBOT_ERROR_LOG_MAX_TURNS", "12"))
 
 def _redact_secrets(text: str) -> str:
     """
@@ -246,6 +293,79 @@ def _log_content(log: logging.Logger, label: str, text: str) -> None:
     safe = _truncate_for_log(_redact_secrets(text), LOG_CONTENT_MAX_CHARS)
     _log_banner(log, f"{label}: {safe}")
 
+def _is_error_message(text: str) -> bool:
+    return (text or "").lstrip().startswith("Error:")
+
+def _safe_history_for_error_log(history: list[dict[str, str]]) -> list[dict[str, str]]:
+    keep = history[-ERROR_LOG_MAX_TURNS:] if ERROR_LOG_MAX_TURNS > 0 else []
+    out: list[dict[str, str]] = []
+    for item in keep:
+        role = item.get("role")
+        txt = item.get("text")
+        if role not in ("user", "assistant") or not isinstance(txt, str):
+            continue
+        out.append({"role": role, "text": _truncate_for_log(_redact_secrets(txt), 2000)})
+    return out
+
+def _append_error_log(
+    *,
+    log: logging.Logger,
+    session_key: str,
+    team_id: str,
+    channel_id: str,
+    thread_ts: str,
+    user_id: Optional[str],
+    raw_text: str,
+    session: Session,
+    answer_text: str,
+    purpose: str,
+    exc: Optional[BaseException] = None,
+) -> None:
+    """
+    Append one NDJSON line per error response, for later analysis.
+    This is best-effort and never raises.
+    """
+    try:
+        parent = os.path.dirname(ERROR_LOG_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        entry: dict[str, Any] = {
+            "timestamp_ms": int(time.time() * 1000),
+            "session_key": session_key,
+            "team_id": team_id,
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "user_id": user_id,
+            "purpose": purpose,
+            "ticket_key": session.ticket_key,
+            "github_repo": session.github_repo,
+            "pr_number": session.pr_number,
+            "pr_url": session.pr_url,
+            "raw_text": _truncate_for_log(_redact_secrets(raw_text or ""), 4000),
+            "answer_text": _truncate_for_log(_redact_secrets(answer_text or ""), 4000),
+            "history": _safe_history_for_error_log(session.history),
+            "env": {
+                "CURSOR_MODEL": CURSOR_MODEL,
+                "CURSOR_TIMEOUT_SECONDS": CURSOR_TIMEOUT_SECONDS,
+                "CURSOR_RETRIES": CURSOR_RETRIES,
+                "SLACKBOT_WORKERS": WORKERS,
+            },
+        }
+        if exc is not None:
+            entry["exception"] = _truncate_for_log(_redact_secrets(repr(exc)), 2000)
+            entry["traceback"] = _truncate_for_log(_redact_secrets(traceback.format_exc()), 12000)
+
+        with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        try:
+            log.info("\033[1mBUGBOT_ERROR_LOGGED\033[0m path=%s session=%s", ERROR_LOG_PATH, session_key)
+        except Exception:
+            pass
+    except Exception:
+        return
+
 def _extract_first_json_object(text: str) -> Optional[str]:
     """
     Best-effort extraction of the first JSON object from LLM output.
@@ -258,6 +378,215 @@ def _extract_first_json_object(text: str) -> Optional[str]:
         return s
     m = re.search(r"\{[\s\S]*\}", s)
     return m.group(0).strip() if m else None
+
+def _http_get_json(url: str, headers: dict[str, str], *, timeout: int = 30) -> Any:
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    return json.loads(body)
+
+def _http_get_text(url: str, headers: dict[str, str], *, timeout: int = 60) -> str:
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+def _jira_basic_auth_header(email: str, api_token: str) -> str:
+    raw = f"{email}:{api_token}".encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("utf-8")
+
+def _adf_text(adf: Any) -> str:
+    """
+    Very small Atlassian Document Format -> plain text extractor.
+    Good enough for ticket descriptions in summaries.
+    """
+    if adf is None:
+        return ""
+    if isinstance(adf, str):
+        return adf
+    if isinstance(adf, list):
+        return "".join(_adf_text(x) for x in adf)
+    if not isinstance(adf, dict):
+        return ""
+
+    t = adf.get("type")
+    if t == "text":
+        return str(adf.get("text") or "")
+    if t in {"hardBreak"}:
+        return "\n"
+
+    content = adf.get("content")
+    inner = _adf_text(content)
+    if t in {"paragraph", "heading", "blockquote"}:
+        return inner.strip() + "\n"
+    if t in {"listItem"}:
+        return inner
+    if t in {"bulletList", "orderedList"}:
+        return inner + "\n"
+    return inner
+
+def fetch_jira_issue_for_ticket(*, ticket_key: str) -> dict[str, Any]:
+    if not JIRA_EMAIL or not JIRA_API_TOKEN:
+        raise RuntimeError("Missing Jira credentials (JIRA_EMAIL/JIRA_API_TOKEN).")
+    api_url = f"{JIRA_BASE_URL.rstrip('/')}/rest/api/3/issue/{ticket_key}"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": _jira_basic_auth_header(JIRA_EMAIL, JIRA_API_TOKEN),
+    }
+    try:
+        issue = _http_get_json(api_url, headers=headers, timeout=30)
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise RuntimeError(f"Jira API request failed ({e.code}) for {api_url}. Details: {detail}") from e
+    return issue if isinstance(issue, dict) else {}
+
+def _github_headers() -> dict[str, str]:
+    if not GITHUB_TOKEN:
+        raise RuntimeError("Missing GitHub credentials (GITHUB_TOKEN).")
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "BugBot",
+    }
+
+def fetch_github_pr(*, repo: str, pr_number: int) -> dict[str, Any]:
+    url = f"{GITHUB_API_BASE}/repos/{repo}/pulls/{int(pr_number)}"
+    return _http_get_json(url, headers=_github_headers(), timeout=30)
+
+def fetch_github_pr_files(*, repo: str, pr_number: int, max_files: int = 500) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    page = 1
+    per_page = 100
+    while True:
+        url = f"{GITHUB_API_BASE}/repos/{repo}/pulls/{int(pr_number)}/files?per_page={per_page}&page={page}"
+        data = _http_get_json(url, headers=_github_headers(), timeout=30)
+        if not isinstance(data, list) or not data:
+            break
+        for item in data:
+            if isinstance(item, dict):
+                files.append(item)
+                if len(files) >= max_files:
+                    return files
+        if len(data) < per_page:
+            break
+        page += 1
+    return files
+
+def fetch_github_pr_diff(*, repo: str, pr_number: int) -> str:
+    """
+    Fetch the full PR diff as text.
+    """
+    if not GITHUB_TOKEN:
+        raise RuntimeError("Missing GitHub credentials (GITHUB_TOKEN).")
+    url = f"{GITHUB_API_BASE}/repos/{repo}/pulls/{int(pr_number)}"
+    headers = dict(_github_headers())
+    headers["Accept"] = "application/vnd.github.v3.diff"
+    return _http_get_text(url, headers=headers, timeout=90)
+
+def search_github_pr_number_for_ticket(*, repo: str, ticket_key: str) -> Optional[int]:
+    """
+    Best-effort: search PRs in repo containing the ticket key.
+    """
+    q = urllib.parse.quote(f"repo:{repo} is:pr {ticket_key}")
+    url = f"{GITHUB_API_BASE}/search/issues?q={q}&sort=updated&order=desc"
+    data = _http_get_json(url, headers=_github_headers(), timeout=30)
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None
+    for it in items[:5]:
+        if not isinstance(it, dict):
+            continue
+        num = it.get("number")
+        if isinstance(num, int):
+            return num
+    return None
+
+def _parse_pr_from_url(pr_url: str) -> tuple[Optional[str], Optional[int]]:
+    m = re.search(r"https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)", pr_url or "", re.IGNORECASE)
+    if not m:
+        return None, None
+    repo = f"{m.group(1).strip()}/{m.group(2).strip()}"
+    return repo, int(m.group(3))
+
+def write_review_context_markdown(
+    *,
+    ticket_key: str,
+    jira_issue: dict[str, Any],
+    repo: str,
+    pr_number: int,
+    pr: dict[str, Any],
+    pr_files: list[dict[str, Any]],
+) -> str:
+    fields = jira_issue.get("fields", {}) if isinstance(jira_issue, dict) else {}
+    summary = str(fields.get("summary") or "").strip()
+    issue_type = str((fields.get("issuetype") or {}).get("name") or "").strip()
+    priority = str((fields.get("priority") or {}).get("name") or "").strip()
+    description_text = _adf_text(fields.get("description")).strip()
+    if not description_text:
+        description_text = "(No Jira description provided)"
+
+    pr_url = str(pr.get("html_url") or "").strip()
+    pr_title = str(pr.get("title") or "").strip()
+    base_ref = str((pr.get("base") or {}).get("ref") or "").strip()
+    head_ref = str((pr.get("head") or {}).get("ref") or "").strip()
+    additions = pr.get("additions")
+    deletions = pr.get("deletions")
+    changed_files = pr.get("changed_files")
+
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    path = _allocate_review_context_path(ticket_key=ticket_key)
+
+    changed_list = "\n".join(f"• {str(f.get('filename') or '').strip()}" for f in pr_files if isinstance(f, dict) and str(f.get("filename") or "").strip())
+    if not changed_list:
+        changed_list = "(No files list available)"
+
+    text = (
+        f"# PR Review Context — {ticket_key}\n\n"
+        f"Generated: {now}\n"
+        f"Repo: {repo}\n"
+        f"PR: {pr_url or '(unknown)'}\n"
+        f"Base: {base_ref or '(unknown)'}\n"
+        f"Head: {head_ref or '(unknown)'}\n"
+        f"Diff stat: +{additions if isinstance(additions,int) else '?'} -{deletions if isinstance(deletions,int) else '?'}; files={changed_files if isinstance(changed_files,int) else '?'}\n\n"
+        f"## Ticket\n"
+        f"• Key: {ticket_key}\n"
+        f"• URL: {JIRA_BASE_URL.rstrip('/')}/browse/{ticket_key}\n"
+        f"• Summary: {summary}\n"
+        f"• Type: {issue_type}\n"
+        f"• Priority: {priority}\n\n"
+        f"### Jira description\n"
+        f"{description_text}\n\n"
+        f"## PR\n"
+        f"• Title: {pr_title}\n"
+        f"• URL: {pr_url}\n\n"
+        f"## Changed files\n"
+        f"{changed_list}\n\n"
+    )
+
+    # Full diff is fetched from GitHub and embedded. This can be very large by design.
+    diff_text = fetch_github_pr_diff(repo=repo, pr_number=int(pr_number))
+    if diff_text.strip():
+        text += "## Patch (full)\n```diff\n" + diff_text.strip() + "\n```\n"
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".review_context_", suffix=".md", dir=parent or None)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text.rstrip() + "\n")
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+    return path
 
 def _cursor_interpreter_prompt(*, raw_text: str, session: Session, is_app_mention: bool) -> str:
     """
@@ -274,9 +603,6 @@ def _cursor_interpreter_prompt(*, raw_text: str, session: Session, is_app_mentio
         "pr_number": session.pr_number,
         "github_repo": session.github_repo or GITHUB_REPO,
     }
-    # Keep transcript short for interpretation.
-    prior = session.history[-10:] if session.history else []
-    transcript = _format_history_for_prompt(prior)
 
     return (
         "You are a Slack message interpreter for BugBot.\n"
@@ -293,9 +619,9 @@ def _cursor_interpreter_prompt(*, raw_text: str, session: Session, is_app_mentio
         "- If the user explicitly indicates a different ticket than the session, set ticket_key and should_override_ticket=true.\n"
         "- If this is a follow-up and the ticket is not specified, set ticket_key=null and should_override_ticket=false.\n"
         "- Only set pr_number/pr_url when the user clearly refers to a PR (e.g., GitHub URL or \"PR 123\").\n"
-        "- Prefer github_repo from context; otherwise null.\n\n"
+        "- Prefer github_repo from context; otherwise null.\n"
+        "- IMPORTANT: Derive `question` ONLY from the Raw Slack message below (not from prior conversation/session history).\n\n"
         f"Session state JSON:\n{json.dumps(session_state, ensure_ascii=False)}\n\n"
-        f"Conversation so far:\n{transcript}\n\n"
         "Raw Slack message (verbatim):\n"
         f"{raw}\n\n"
         "Slack message with leading @mentions removed (if any):\n"
@@ -305,7 +631,7 @@ def _cursor_interpreter_prompt(*, raw_text: str, session: Session, is_app_mentio
 def interpret_message_via_llm(*, raw_text: str, session: Session, is_app_mention: bool) -> dict[str, Any]:
     _log_content(logging.getLogger("slackbot"), "BUGBOT_USER_MESSAGE", raw_text or "")
     prompt = _cursor_interpreter_prompt(raw_text=raw_text, session=session, is_app_mention=is_app_mention)
-    out = _run_cursor_agent(prompt)
+    out = _run_cursor_agent(prompt, purpose="interpret")
     # Do NOT normalize for Slack here; we need JSON.
     candidate = _extract_first_json_object(out) or ""
     try:
@@ -391,19 +717,8 @@ def _read_context_md(path: str) -> str:
 
 
 def _compact_context_md(full_md: str) -> str:
-    s = (full_md or "").strip()
-
-    # Drop huge patch section if present.
-    m = re.search(r"^\s*##\s+Patch\b", s, flags=re.IGNORECASE | re.MULTILINE)
-    if m:
-        s = s[: m.start()].rstrip()
-
-    # Hard-cap prompt size
-    max_chars = 12000
-    if len(s) > max_chars:
-        s = s[:max_chars].rstrip() + "\n\n(TRUNCATED)"
-
-    return s
+    # Full context mode: do not truncate or drop patch.
+    return (full_md or "").strip()
 
 
 def _build_prompt(*, ticket_key: str, question: str, context_md: str) -> str:
@@ -413,7 +728,8 @@ def _build_prompt(*, ticket_key: str, question: str, context_md: str) -> str:
         "Use the provided PR Review Context as the primary source of truth.\n"
         "If needed, you may inspect the local Labguru repo code to verify details.\n"
         "If the context is missing the needed detail, say what is missing.\n"
-        "Be concise.\n"
+        "Be short and concise by default.\n"
+        "Unless the user explicitly asks for detail, keep the answer to 2-5 bullets and <= 8 lines total.\n"
         "Output format for Slack:\n"
         "- Prefer plain text.\n"
         "- Use bullet points prefixed with '• ' (not '-').\n"
@@ -445,20 +761,40 @@ def _build_prompt_with_history(
     question: str,
     context_md: str,
     history: list[dict[str, str]],
+    git_mode: bool = False,
 ) -> str:
     transcript = _format_history_for_prompt(history)
+    git_mode_instr = ""
+    if git_mode:
+        git_mode_instr = (
+            "\n"
+            "GIT MODE:\n"
+            "- Be skeptical: default to NO.\n"
+            "- Say YES only if you can point to a concrete change (file/function + what to change) and a clear reason (bug/requirement gap).\n"
+            "- If you lack enough evidence/context to propose a specific change, you MUST answer NO (reason: insufficient evidence).\n"
+            "- If you answer NO, add a short, firm, professional follow-up line (1 line) that asks for concrete evidence (repro/log/spec/policy) before proposing changes.\n"
+            "- At the VERY end of your answer, append exactly one extra line:\n"
+            "  GIT MODE: code change recommended: YES|NO — <short reason>\n"
+            "- Keep it as the last line (no bullets).\n"
+        )
     return (
         "You are BugBot, a Slack bot that answers questions about a Jira ticket / PR using a saved PR review context file.\n"
         "Your user is chatting with you in Slack and expects Slack-friendly output.\n"
         "Use the provided PR Review Context and the conversation so far.\n"
         "You may inspect the local Labguru repo code if needed to answer precisely.\n"
         "If the context is missing the needed detail, say what is missing.\n"
-        "Be concise.\n"
+        "Be short and concise by default.\n"
+        "Unless the user explicitly asks for detail, keep the answer to 2-5 bullets and <= 8 lines total.\n"
+        "IMPORTANT:\n"
+        "- Answer ONLY the 'Latest user question' at the bottom.\n"
+        "- Do NOT answer earlier questions from the transcript unless the user explicitly asks you to.\n"
+        "- If the latest message contains multiple distinct questions, answer ONLY the last one.\n"
         "Output format for Slack:\n"
         "- Prefer plain text.\n"
         "- Use bullet points prefixed with '• ' (not '-').\n"
         "- Do NOT use Markdown bold like **this** (Slack won't render it). Use plain text or *single-asterisk* if you must.\n"
         "- Avoid headings like '###'.\n\n"
+        f"{git_mode_instr}\n"
         f"Ticket: {ticket_key}\n\n"
         "--- BEGIN PR REVIEW CONTEXT ---\n"
         f"{context_md}\n"
@@ -547,7 +883,7 @@ def _ensure_labguru_main_worktree(*, log: logging.Logger) -> str:
         return LABGURU_REPO_DIR
 
 
-def _run_cursor_agent(prompt: str, *, cwd_override: Optional[str] = None) -> str:
+def _run_cursor_agent(prompt: str, *, cwd_override: Optional[str] = None, purpose: str = "unknown") -> str:
     cmd = [CURSOR_BIN, "-p", prompt, "--model", CURSOR_MODEL]
     if cwd_override and os.path.isdir(cwd_override):
         cwd = cwd_override
@@ -560,6 +896,9 @@ def _run_cursor_agent(prompt: str, *, cwd_override: Optional[str] = None) -> str
     last_rc = 0
 
     for attempt_idx in range(attempts_total):
+        attempt_n = attempt_idx + 1
+        t0 = time.time()
+        prompt_len = len(prompt or "")
         try:
             p = subprocess.run(cmd, text=True, capture_output=True, timeout=CURSOR_TIMEOUT_SECONDS, cwd=cwd)
         except FileNotFoundError:
@@ -570,6 +909,7 @@ def _run_cursor_agent(prompt: str, *, cwd_override: Optional[str] = None) -> str
         last_stdout = p.stdout or ""
         last_stderr = p.stderr or ""
         last_rc = int(p.returncode)
+        elapsed_ms = int((time.time() - t0) * 1000)
 
         combined = _strip_ansi((last_stdout or "") + ("\n" + last_stderr if last_stderr else ""))
         combined_lower = combined.lower()
@@ -578,10 +918,23 @@ def _run_cursor_agent(prompt: str, *, cwd_override: Optional[str] = None) -> str
         if "connection stalled" in combined_lower and attempt_idx < attempts_total - 1:
             try:
                 logging.getLogger("slackbot").warning(
-                    "cursor-agent failed with 'Connection stalled' (attempt %d/%d); retrying...",
-                    attempt_idx + 1,
+                    "cursor-agent stalled (purpose=%s attempt=%d/%d elapsed_ms=%d model=%s timeout_s=%s cwd=%s prompt_len=%d stdout_len=%d stderr_len=%d). Retrying...",
+                    purpose,
+                    attempt_n,
                     attempts_total,
+                    elapsed_ms,
+                    CURSOR_MODEL,
+                    str(CURSOR_TIMEOUT_SECONDS),
+                    cwd,
+                    prompt_len,
+                    len(last_stdout or ""),
+                    len(last_stderr or ""),
                 )
+                # Include a tiny snippet to help diagnose without dumping content
+                snippet = (last_stderr or last_stdout or "").strip().replace("\r\n", "\n")
+                if snippet:
+                    snippet = _truncate_for_log(_redact_secrets(snippet), 300)
+                    logging.getLogger("slackbot").warning("cursor-agent stalled snippet: %s", snippet)
             except Exception:
                 pass
             time.sleep(max(0.0, CURSOR_RETRY_BACKOFF_SECONDS) * (attempt_idx + 1))
@@ -589,6 +942,24 @@ def _run_cursor_agent(prompt: str, *, cwd_override: Optional[str] = None) -> str
 
         # Success or non-retryable failure
         out = combined
+        # Helpful metadata for any non-zero exit
+        if last_rc != 0:
+            try:
+                logging.getLogger("slackbot").warning(
+                    "cursor-agent nonzero exit (purpose=%s rc=%d attempt=%d/%d elapsed_ms=%d model=%s cwd=%s prompt_len=%d stdout_len=%d stderr_len=%d)",
+                    purpose,
+                    last_rc,
+                    attempt_n,
+                    attempts_total,
+                    elapsed_ms,
+                    CURSOR_MODEL,
+                    cwd,
+                    prompt_len,
+                    len(last_stdout or ""),
+                    len(last_stderr or ""),
+                )
+            except Exception:
+                pass
         break
 
     lines: list[str] = []
@@ -807,6 +1178,12 @@ def _answer_with_session(
     ticket_key = interp.get("ticket_key")
     should_override_ticket = bool(interp.get("should_override_ticket"))
     question = str(interp.get("question") or "").strip()
+    git_mode_now, question = _extract_git_mode(question=question)
+    if git_mode_now and not sess.git_mode_enabled:
+        sess.git_mode_enabled = True
+        sess.updated_at_ms = int(time.time() * 1000)
+        store.save()
+    git_mode = bool(git_mode_now or sess.git_mode_enabled)
     _log_content(log, "BUGBOT_QUESTION", question)
 
     pr_url = interp.get("pr_url")
@@ -827,6 +1204,9 @@ def _answer_with_session(
     elif isinstance(pr_number, str) and pr_number.strip().isdigit():
         sess.pr_number = int(pr_number.strip())
 
+    if git_mode_now and not question:
+        return "GIT MODE enabled for this thread. Ask your question."
+
     # If no ticket is inferred/known for this thread, answer as a general Labguru main-branch question.
     if not sess.ticket_key:
         if not question:
@@ -835,21 +1215,40 @@ def _answer_with_session(
         main_cwd = _ensure_labguru_main_worktree(log=log)
         prior_history = sess.history[:-1] if sess.history else []
         transcript = _format_history_for_prompt(prior_history[-20:])
+        git_mode_instr = ""
+        if git_mode:
+            git_mode_instr = (
+                "\n"
+                "GIT MODE:\n"
+                "- Be skeptical: default to NO.\n"
+                "- Say YES only if you can point to a concrete change (file/function + what to change) and a clear reason (bug/requirement gap).\n"
+                "- If you lack enough evidence/context to propose a specific change, you MUST answer NO (reason: insufficient evidence).\n"
+                "- If you answer NO, add a short, firm, professional follow-up line (1 line) that asks for concrete evidence (repro/log/spec/policy) before proposing changes.\n"
+                "- At the VERY end of your answer, append exactly one extra line:\n"
+                "  GIT MODE: code change recommended: YES|NO — <short reason>\n"
+                "- Keep it as the last line (no bullets).\n"
+            )
         prompt = (
             "You are BugBot, a Slack bot that answers questions about the Labguru codebase.\n"
             "Your user is chatting with you in Slack and expects Slack-friendly output.\n"
             f"Answer based on the Labguru repository main branch checkout located at: {main_cwd}\n"
-            "Be concise.\n"
+            "Be short and concise by default.\n"
+            "Unless the user explicitly asks for detail, keep the answer to 2-5 bullets and <= 8 lines total.\n"
+            "IMPORTANT:\n"
+            "- Answer ONLY the 'Latest user question' at the bottom.\n"
+            "- Do NOT answer earlier questions from the transcript unless the user explicitly asks you to.\n"
+            "- If the latest message contains multiple distinct questions, answer ONLY the last one.\n"
             "Output format for Slack:\n"
             "- Prefer plain text.\n"
             "- Use bullet points prefixed with '• ' (not '-').\n"
             "- Avoid headings like '###'.\n\n"
+            f"{git_mode_instr}\n"
             "--- BEGIN CONVERSATION SO FAR ---\n"
             f"{transcript}\n"
             "--- END CONVERSATION SO FAR ---\n\n"
             f"Latest user question: {question}\n"
         )
-        answer = _run_cursor_agent(prompt, cwd_override=main_cwd)
+        answer = _run_cursor_agent(prompt, cwd_override=main_cwd, purpose="answer_main")
         answer = _normalize_for_slack(answer)
         _log_content(log, "BUGBOT_ANSWER", answer)
         sess.history.append({"role": "assistant", "text": answer})
@@ -868,10 +1267,53 @@ def _answer_with_session(
 
     path = _find_review_context_file(sess.ticket_key)
     if not path:
-        return (
-            f"Could not find a `review_context` summary for `{sess.ticket_key}`.\n"
-            f"Expected a file named like `{sess.ticket_key}.md` or containing the ticket key under `{REVIEW_CONTEXT_DIR}`."
-        )
+        # Auto-generate review_context when missing (best-effort).
+        try:
+            repo = (sess.github_repo or GITHUB_REPO or DEFAULT_GITHUB_REPO).strip()
+
+            pr_repo = None
+            pr_number: Optional[int] = sess.pr_number
+            if sess.pr_url:
+                pr_repo, parsed_num = _parse_pr_from_url(sess.pr_url)
+                if parsed_num:
+                    pr_number = parsed_num
+            if pr_repo:
+                repo = pr_repo
+
+            if pr_number is None:
+                pr_number = search_github_pr_number_for_ticket(repo=repo, ticket_key=sess.ticket_key)
+                if pr_number is not None:
+                    sess.pr_number = pr_number
+                    sess.github_repo = repo
+                    sess.updated_at_ms = int(time.time() * 1000)
+                    store.save()
+
+            if pr_number is None:
+                return (
+                    f"I don’t have a `review_context` summary for `{sess.ticket_key}` yet.\n"
+                    "Reply with the PR URL (e.g., `https://github.com/BioData/Labguru/pull/1234`) or `PR 1234`, "
+                    "and I’ll generate the summary automatically."
+                )
+
+            jira_issue = fetch_jira_issue_for_ticket(ticket_key=sess.ticket_key)
+            pr = fetch_github_pr(repo=repo, pr_number=pr_number)
+            pr_files = fetch_github_pr_files(repo=repo, pr_number=pr_number)
+            wrote = write_review_context_markdown(
+                ticket_key=sess.ticket_key,
+                jira_issue=jira_issue,
+                repo=repo,
+                pr_number=int(pr_number),
+                pr=pr,
+                pr_files=pr_files,
+            )
+            log.info("Generated review_context: %s", wrote)
+            path = wrote
+        except Exception as e:
+            return (
+                f"Could not find a `review_context` summary for `{sess.ticket_key}` and failed to generate one.\n"
+                f"Error: {e}\n"
+                "If you provide a PR URL/number and ensure `JIRA_EMAIL`/`JIRA_API_TOKEN` and `GITHUB_TOKEN` are set, I can generate it."
+            )
 
     context_full = _read_context_md(path)
     context_md = _compact_context_md(context_full)
@@ -883,8 +1325,9 @@ def _answer_with_session(
         question=question,
         context_md=context_md,
         history=prior_history,
+        git_mode=git_mode,
     )
-    answer = _run_cursor_agent(prompt)
+    answer = _run_cursor_agent(prompt, purpose="answer_ticket")
     answer = _normalize_for_slack(answer)
     _log_content(log, "BUGBOT_ANSWER", answer)
 
@@ -966,15 +1409,44 @@ def main() -> None:
                     placeholder_ts=placeholder_ts,
                     answer=answer,
                 )
+                if _is_error_message(answer):
+                    sess = store.get(session_key)
+                    _append_error_log(
+                        log=log,
+                        session_key=session_key,
+                        team_id=str(team_id),
+                        channel_id=str(channel),
+                        thread_ts=str(thread_ts),
+                        user_id=str(event.get("user") or "") or None,
+                        raw_text=text,
+                        session=sess,
+                        answer_text=answer,
+                        purpose="app_mention",
+                    )
                 _log_banner(log, f"BUGBOT_JOB_END session={session_key} status=ANSWER_SENT")
             except Exception as e:
                 logger.exception("slackbot processing failed")
+                err_text = f"Error: {e}"
                 _update_or_post_answer(
                     client=client,
                     channel=str(channel),
                     thread_ts=str(thread_ts),
                     placeholder_ts=placeholder_ts,
-                    answer=f"Error: {e}",
+                    answer=err_text,
+                )
+                sess = store.get(session_key)
+                _append_error_log(
+                    log=log,
+                    session_key=session_key,
+                    team_id=str(team_id),
+                    channel_id=str(channel),
+                    thread_ts=str(thread_ts),
+                    user_id=str(event.get("user") or "") or None,
+                    raw_text=text,
+                    session=sess,
+                    answer_text=err_text,
+                    purpose="app_mention_exception",
+                    exc=e,
                 )
                 _log_banner(log, f"BUGBOT_JOB_END session={session_key} status=ERROR_SENT")
 
@@ -1055,15 +1527,44 @@ def main() -> None:
                     placeholder_ts=placeholder_ts,
                     answer=answer,
                 )
+                if _is_error_message(answer):
+                    sess = store.get(session_key)
+                    _append_error_log(
+                        log=log,
+                        session_key=session_key,
+                        team_id=str(team_id),
+                        channel_id=str(channel),
+                        thread_ts=str(thread_ts),
+                        user_id=str(event.get("user") or "") or None,
+                        raw_text=text,
+                        session=sess,
+                        answer_text=answer,
+                        purpose="dm",
+                    )
                 _log_banner(log, f"BUGBOT_JOB_END session={session_key} status=ANSWER_SENT")
             except Exception as e:
                 logger.exception("slackbot DM processing failed")
+                err_text = f"Error: {e}"
                 _update_or_post_answer(
                     client=client,
                     channel=str(channel),
                     thread_ts=str(thread_ts),
                     placeholder_ts=placeholder_ts,
-                    answer=f"Error: {e}",
+                    answer=err_text,
+                )
+                sess = store.get(session_key)
+                _append_error_log(
+                    log=log,
+                    session_key=session_key,
+                    team_id=str(team_id),
+                    channel_id=str(channel),
+                    thread_ts=str(thread_ts),
+                    user_id=str(event.get("user") or "") or None,
+                    raw_text=text,
+                    session=sess,
+                    answer_text=err_text,
+                    purpose="dm_exception",
+                    exc=e,
                 )
                 _log_banner(log, f"BUGBOT_JOB_END session={session_key} status=ERROR_SENT")
 
