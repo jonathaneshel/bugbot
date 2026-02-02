@@ -1,0 +1,11 @@
+be mindful of overall codelines
+prefer overriding existing mechanism rather than creating new ones
+when a file gets too big - rethink the file/folder structure
+maintain best practices when coding, especially DRY
+if you want to create env vars, ask for permission first
+when something's not working as expected:
+1. start the answer with "BUG MODE" and then find the reason by looking at the logs, not at the code.
+2. if you still cannot find the reason, DO NOT add functionality, instead add logs that will make you find it next time
+dont run snyk check unless specifically prompted to - run it only very large changes
+DO NO COMMIT/PUSH ANYTHING
+pc means protocol converter, ds means data science
