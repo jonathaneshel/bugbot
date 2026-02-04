@@ -55,6 +55,53 @@ python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/ticket_runner.py" 1234 -
 
 This will **skip** `karamba new` and **skip** `karamba pr`, but will still run Cursor, commit, and **force-push** the current branch to update the existing PR.
 
+## Git mode (address PR review comments)
+
+`git_mode.py` is a local helper that:
+
+- Fetches the Jira ticket
+- Finds the matching GitHub PR (by searching for the ticket key) or uses `--pr-number/--pr-url`
+- Checks out the PR head branch locally
+- Reads the diff and all PR comments (inline review comments + PR conversation comments)
+- For each comment not authored by `--my-login` (default: `jonathaneshel`):
+  - Decides (conservatively) whether code changes should be made
+  - If yes: makes the minimal fix and then stages the changes
+  - Suggests a short, friendly reply you can paste
+  - Says whether the existing `.cursorrules` would have prevented it; if not, suggests a rule to add
+
+Safety:
+
+- It **errors** if your repo has any tracked changes (staged or unstaged) before it starts.
+- It does **NOT** commit or push.
+
+Requirements:
+
+- Jira credentials in env vars:
+  - `JIRA_EMAIL`
+  - `JIRA_API_TOKEN`
+- GitHub token:
+  - `GITHUB_TOKEN`
+- Optional:
+  - `GITHUB_REPO` (defaults to `BioData/Labguru`)
+  - `GITHUB_API_BASE` (defaults to `https://api.github.com`)
+
+Usage:
+
+```bash
+export JIRA_EMAIL="you@company.com"
+export JIRA_API_TOKEN="..."
+export GITHUB_TOKEN="ghp_..."
+
+python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/git_mode.py" 26929
+
+# Override PR detection:
+python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/git_mode.py" 26929 --pr-number 9135
+python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/git_mode.py" 26929 --pr-url "https://github.com/BioData/Labguru/pull/9135"
+
+# Stage only (no commit/push):
+python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/git_mode.py" 26929 --no-push
+```
+
 ## Jira autofill from RUNNER_OUTPUT (optional)
 
 If you create a file at:

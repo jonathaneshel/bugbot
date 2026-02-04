@@ -19,6 +19,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from runner.jira import fetch_jira_issue
+
 
 BUGBOT_FILES_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_REVIEW_CONTEXT_DIR = os.path.join(BUGBOT_FILES_DIR, "review_context")
@@ -29,6 +31,14 @@ DEFAULT_GITHUB_OWNER = "BioData"
 DEFAULT_GITHUB_REPO = "Labguru"
 
 GITHUB_API_BASE = "https://api.github.com"
+
+DEFAULT_JIRA_BASE_URL = "https://labguru.atlassian.net"
+JIRA_BASE_URL = os.getenv("JIRA_BASE_URL", DEFAULT_JIRA_BASE_URL).rstrip("/")
+JIRA_EMAIL = (os.getenv("JIRA_EMAIL", "") or "").strip()
+JIRA_API_TOKEN = (os.getenv("JIRA_API_TOKEN", "") or "").strip()
+
+# When auto-generating review_context, keep the diff bounded.
+MAX_AUTOGEN_PR_DIFF_CHARS = int(os.getenv("GITBOT_AUTOGEN_PR_DIFF_MAX_CHARS", "120000"))
 
 
 def _now_ts() -> int:
@@ -285,6 +295,77 @@ class ResolvedContext:
     pr: Optional[PRInfo]
 
 
+def _write_review_context_markdown_autogen(
+    *,
+    review_context_dir: str,
+    ticket_key: str,
+    jira_issue,
+    owner: str,
+    repo: str,
+    pr: Optional[PRInfo],
+    pr_files: list[dict[str, Any]],
+    pr_diff: str,
+) -> str:
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    path = _allocate_review_context_path(review_context_dir=review_context_dir, ticket_key=ticket_key)
+
+    pr_url = pr.html_url if pr else ""
+    pr_title = pr.title if pr else ""
+    base_ref = pr.base_ref if pr else ""
+    head_ref = pr.head_ref if pr else ""
+
+    changed_list = "\n".join(
+        f"• {str(f.get('filename') or '').strip()}"
+        for f in pr_files
+        if isinstance(f, dict) and str(f.get("filename") or "").strip()
+    )
+    if not changed_list:
+        changed_list = "(No files list available)"
+
+    diff_text = _truncate(pr_diff, MAX_AUTOGEN_PR_DIFF_CHARS)
+    if not diff_text:
+        diff_text = "(No diff available)"
+
+    md = (
+        f"# PR Review Context — {ticket_key}\n\n"
+        f"Generated: {now}\n"
+        f"Repo: {owner}/{repo}\n"
+        f"PR: {pr_url or '(unknown)'}\n"
+        f"Base: {base_ref or '(unknown)'}\n"
+        f"Head: {head_ref or '(unknown)'}\n\n"
+        f"## Ticket\n"
+        f"• Key: {ticket_key}\n"
+        f"• URL: {jira_issue.url}\n"
+        f"• Summary: {jira_issue.summary}\n"
+        f"• Type: {jira_issue.issue_type}\n"
+        f"• Priority: {jira_issue.priority}\n\n"
+        f"### Jira description\n"
+        f"{jira_issue.description_text or '(No Jira description provided)'}\n\n"
+        f"## PR\n"
+        f"• Title: {pr_title}\n"
+        f"• URL: {pr_url}\n\n"
+        f"## Changed files\n"
+        f"{changed_list}\n\n"
+        f"## Patch (truncated)\n```diff\n{diff_text}\n```\n"
+    )
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".review_context_", suffix=".md", dir=parent or None)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(md.rstrip() + "\n")
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+    return path
+
+
 def _iso_to_dt(iso_ts: str) -> datetime.datetime:
     s = (iso_ts or "").strip()
     if not s:
@@ -342,6 +423,35 @@ def _compact_context_md(full_md: str) -> str:
     if len(s) > max_chars:
         s = s[:max_chars].rstrip() + "\n\n(TRUNCATED)"
     return s
+
+
+def _safe_filename_component(s: str) -> str:
+    s = (s or "").strip()
+    s = s.replace(os.sep, "-")
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-") or "unknown"
+
+
+def _allocate_review_context_path(*, review_context_dir: str, ticket_key: str) -> str:
+    os.makedirs(review_context_dir, exist_ok=True)
+    ticket_part = _safe_filename_component(ticket_key)
+    base = os.path.join(review_context_dir, f"{ticket_part}.md")
+    if not os.path.exists(base):
+        return base
+    i = 2
+    while True:
+        candidate = os.path.join(review_context_dir, f"{ticket_part}__{i}.md")
+        if not os.path.exists(candidate):
+            return candidate
+        i += 1
+
+
+def _truncate(s: str, max_chars: int) -> str:
+    s2 = (s or "").replace("\r\n", "\n").strip()
+    if max_chars <= 0:
+        return ""
+    if len(s2) <= max_chars:
+        return s2
+    return s2[:max_chars].rstrip() + "\n\n(TRUNCATED)"
 
 
 def _list_review_context_files(review_context_dir: str) -> list[str]:
@@ -405,6 +515,32 @@ def _gh_get_json(*, auth: GitHubAppAuth, url: str) -> Any:
     if status < 200 or status >= 300:
         raise RuntimeError(f"GitHub API GET failed (HTTP {status}) for {url}: {text[:2000]}")
     return data
+
+
+def _gh_get_text(*, auth: GitHubAppAuth, url: str, accept: str, timeout: float = 90.0) -> str:
+    token = auth.get_installation_token()
+    headers = {**auth._inst_headers(token), "Accept": accept}
+    status, _resp_headers, body = _http_request(method="GET", url=url, headers=headers, timeout=timeout)
+    text = (body or b"").decode("utf-8", errors="replace")
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"GitHub API GET failed (HTTP {status}) for {url}: {text[:2000]}")
+    return text
+
+
+def _fetch_pr_files(*, auth: GitHubAppAuth, owner: str, repo: str, pr_number: int) -> list[dict[str, Any]]:
+    token = auth.get_installation_token()
+    url = f"{auth.api_base}/repos/{owner}/{repo}/pulls/{int(pr_number)}/files?per_page=100"
+    data = _gh_api_json_paginated(method="GET", url=url, headers=auth._inst_headers(token))
+    out: list[dict[str, Any]] = []
+    for it in data:
+        if isinstance(it, dict):
+            out.append(it)
+    return out
+
+
+def _fetch_pr_diff(*, auth: GitHubAppAuth, owner: str, repo: str, pr_number: int) -> str:
+    url = f"{auth.api_base}/repos/{owner}/{repo}/pulls/{int(pr_number)}"
+    return _gh_get_text(auth=auth, url=url, accept="application/vnd.github.v3.diff", timeout=120.0)
 
 
 def _fetch_pr_info(*, auth: GitHubAppAuth, owner: str, repo: str, pr_number: int) -> PRInfo:
@@ -478,10 +614,39 @@ def resolve_context_for_event(
         pref = (project_prefix or "LAB").strip().upper()
         return None, f"Could not infer ticket key. Please include `{pref}-1234` in your @gitbot comment."
     if not context_path or not os.path.exists(context_path):
-        return None, (
-            f"Could not find a matching ticket summary file for `{ticket_key}`.\n"
-            f"Expected a `review_context/*.md` file under: {review_context_dir}"
-        )
+        # Auto-generate context if missing (Jira creds required).
+        if not JIRA_EMAIL or not JIRA_API_TOKEN:
+            return None, (
+                f"Missing Jira credentials; cannot auto-generate `review_context` for `{ticket_key}`.\n"
+                "Set env vars: `JIRA_EMAIL` and `JIRA_API_TOKEN` (and optionally `JIRA_BASE_URL`), then retry."
+            )
+        if not pr_number:
+            return None, f"Could not determine PR number needed to generate context for `{ticket_key}`."
+
+        ticket_number = ticket_key.split("-", 1)[1] if "-" in ticket_key else ""
+        try:
+            jira_issue = fetch_jira_issue(
+                jira_base_url=JIRA_BASE_URL,
+                project_prefix=(project_prefix or "LAB").strip().upper(),
+                ticket_number=ticket_number,
+                email=JIRA_EMAIL,
+                api_token=JIRA_API_TOKEN,
+            )
+            pr_files = _fetch_pr_files(auth=auth, owner=owner, repo=repo, pr_number=int(pr_number))
+            pr_diff = _fetch_pr_diff(auth=auth, owner=owner, repo=repo, pr_number=int(pr_number))
+            wrote_path = _write_review_context_markdown_autogen(
+                review_context_dir=review_context_dir,
+                ticket_key=ticket_key,
+                jira_issue=jira_issue,
+                owner=owner,
+                repo=repo,
+                pr=pr,
+                pr_files=pr_files,
+                pr_diff=pr_diff,
+            )
+            context_path = wrote_path
+        except Exception as e:
+            return None, f"Failed to auto-generate `review_context` for `{ticket_key}`. Error: {e}"
 
     compact = _compact_context_md(_read_text(context_path))
     return ResolvedContext(ticket_key=ticket_key, context_path=context_path, context_md=compact, pr=pr), ""

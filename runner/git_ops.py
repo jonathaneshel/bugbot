@@ -108,6 +108,104 @@ def _git_has_tracked_changes(repo_dir: str) -> bool:
     return unstaged != 0 or staged != 0
 
 
+def _git_status_porcelain(repo_dir: str) -> str:
+    res = _run_cmd(
+        cmd=["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=repo_dir,
+        capture_output=True,
+        check=False,
+    )
+    return res.stdout or ""
+
+
+def _git_has_any_tracked_changes(repo_dir: str) -> bool:
+    out = _git_status_porcelain(repo_dir)
+    for entry in out.split("\0"):
+        if not entry:
+            continue
+        if entry.startswith("?? "):
+            continue
+        return True
+    return False
+
+
+def ensure_clean_tracked_state(*, repo_dir: str, context: str) -> None:
+    if not _git_has_any_tracked_changes(repo_dir):
+        return
+    out = _run_cmd(
+        cmd=["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=repo_dir,
+        capture_output=True,
+        check=False,
+    ).stdout or ""
+    msg = (context or "Repository has tracked changes.").strip()
+    raise RuntimeError(f"{msg}\n\ngit status --porcelain:\n{out.strip()}\n")
+
+
+def fetch_and_checkout_branch(
+    *,
+    repo_dir: str,
+    remote_url: str,
+    remote_name: str,
+    branch: str,
+) -> str:
+    _ensure_git_repo(repo_dir)
+    remote = (remote_name or "origin").strip() or "origin"
+    ref = (branch or "").strip()
+    if not ref:
+        raise RuntimeError("Missing branch name to checkout.")
+    _run_cmd(cmd=["git", "fetch", "--prune", remote, ref], cwd=repo_dir, check=False, capture_output=True)
+    remote_ref = f"{remote}/{ref}"
+    res = _run_cmd(
+        cmd=["git", "show-ref", "--verify", "--quiet", f"refs/remotes/{remote_ref}"],
+        cwd=repo_dir,
+        check=False,
+        capture_output=True,
+    )
+    if res.returncode != 0 and remote_url:
+        _run_cmd(
+            cmd=["git", "fetch", "--prune", remote_url, f"{ref}:refs/remotes/{remote}/{ref}"],
+            cwd=repo_dir,
+            check=False,
+            capture_output=True,
+        )
+    _run_cmd(cmd=["git", "checkout", "-B", ref, remote_ref], cwd=repo_dir, check=True, capture_output=True)
+    return ref
+
+
+def stage_tracked_and_new_untracked(
+    *,
+    repo_dir: str,
+    preexisting_untracked: set[str],
+    exclude_untracked_globs: Optional[list[str]] = None,
+) -> None:
+    _ensure_git_repo(repo_dir)
+    _log("Staging changes (tracked changes + newly created files from this run)...")
+    _run_cmd(cmd=["git", "add", "-u"], cwd=repo_dir)
+
+    post_untracked = _git_untracked_files(repo_dir)
+    new_untracked = sorted(post_untracked - (preexisting_untracked or set()))
+    if new_untracked:
+        effective_excludes = (
+            exclude_untracked_globs
+            if exclude_untracked_globs is not None
+            else (DEFAULT_UNTRACKED_EXCLUDE_GLOBS + _parse_csv_env_list("BUGBOT_UNTRACKED_EXCLUDE_GLOBS"))
+        )
+        filtered = (
+            [p for p in new_untracked if not _matches_any_glob(p, effective_excludes)]
+            if effective_excludes
+            else new_untracked
+        )
+        if filtered:
+            _log(f"Staging {len(filtered)} newly created file(s) from this run...")
+            for chunk in _chunked(filtered, 100):
+                _run_cmd(cmd=["git", "add", "--", *chunk], cwd=repo_dir)
+
+    unstaged = _unstage_paths_matching_globs(repo_dir=repo_dir, globs=DEFAULT_UNTRACKED_EXCLUDE_GLOBS)
+    if unstaged:
+        _log(f"Unstaged {len(unstaged)} file(s) matching exclude globs (e.g. *.md).")
+
+
 def _find_branch_containing_issue_key(repo_dir: str, issue_key: str) -> Optional[str]:
     """
     Find the most recently updated local branch whose name includes the issue key.
