@@ -815,6 +815,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Binary name/path for cursor-agent (default: cursor-agent).",
     )
     parser.add_argument(
+        "--cursor-model",
+        default=os.environ.get("CURSOR_MODEL", "").strip(),
+        help="cursor-agent model to use (defaults to env CURSOR_MODEL; empty = cursor-agent default).",
+    )
+    parser.add_argument(
         "--repo-dir",
         default=DEFAULT_REPO_DIR,
         help=f"Repo directory where karamba + cursor-agent should run (default: {DEFAULT_REPO_DIR}).",
@@ -838,8 +843,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--cursor-timeout-seconds",
         type=int,
-        default=600,
-        help="Timeout for cursor-agent in headless mode (seconds).",
+        default=int(os.environ.get("CURSOR_TIMEOUT_SECONDS", "600")),
+        help="Timeout for cursor-agent in headless mode (seconds). Defaults to env CURSOR_TIMEOUT_SECONDS or 600.",
     )
     parser.add_argument(
         "--cursor-retries",
@@ -963,6 +968,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             timeout_seconds=args.cursor_timeout_seconds,
             retries=args.cursor_retries,
             cursor_bin=args.cursor_bin,
+            cursor_model=args.cursor_model,
         )
     except ClarificationNeeded as e:
         # Print ONLY the questions to stdout, then stop with a non-zero exit code.
@@ -1048,7 +1054,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     except PrCreationError as e:
         pr_create_failed = True
         pr_create_output = e.output
-        _log("PR creation failed. Writing review context packet anyway, then re-raising.")
+        _log("PR creation failed. Writing review context packet anyway, then exiting non-zero.")
 
     wrote_path = write_pr_review_context_file(
         ticket_number=ticket_number,
@@ -1062,7 +1068,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"\nWrote PR review context file:\n{wrote_path}")
 
     if pr_create_failed:
-        raise PrCreationError("karamba pr failed (see PR creation output in context file).", output=pr_create_output)
+        # Common case: GitHub rejects PR creation when there are no commits between the base branch
+        # and the ticket branch. In that case, treat it as "nothing to PR" and exit cleanly
+        # (the context packet already contains the full karamba output).
+        if "No commits between" in (pr_create_output or ""):
+            _log("PR not created: branch has no commits ahead of base (nothing to PR).")
+        return 4
     if args.redo_pr:
         try:
             redo_pr_restore_stash(

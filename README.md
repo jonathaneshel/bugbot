@@ -71,8 +71,10 @@ This will **skip** `karamba new` and **skip** `karamba pr`, but will still run C
 
 Safety:
 
-- It **errors** if your repo has any tracked changes (staged or unstaged) before it starts.
-- It does **NOT** commit or push.
+- By default it **auto-stashes** local changes (including untracked) before it starts, and restores them at the end when safe.
+- To disable auto-stash (and error instead), pass `--no-auto-stash`.
+- By default, if it makes code changes, it will run **specs + rubocop + brakeman**, then **commit and push**.
+- To disable commit/push (stage only), pass `--no-push`.
 
 Requirements:
 
@@ -139,6 +141,21 @@ python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/ticket_runner.py" 1234 -
 ## Cursor plan mode
 
 This script always runs `cursor-agent` and enters plan mode by prefixing the prompt with `/plan`.
+
+## Cursor model selection
+
+If your `cursor-agent` supports `--model`, you can select the model used by BugBot:
+
+```bash
+export CURSOR_MODEL="gpt-5.2-high"
+python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/ticket_runner.py" 1234
+```
+
+Or override per-run:
+
+```bash
+python3 "/Users/jonathaneshel/Desktop/Code/bugbot files/ticket_runner.py" 1234 --cursor-model "gpt-5.2-high"
+```
 
 ## Repo directory (where commands run)
 

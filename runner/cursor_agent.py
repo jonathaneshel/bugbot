@@ -22,12 +22,21 @@ class ClarificationNeeded(RuntimeError):
         self.questions_text = questions_text
 
 
-def _prepare_cursor_invocation(*, prompt: str, cursor_bin: str) -> tuple[list[str], str]:
+def _prepare_cursor_invocation(
+    *,
+    prompt: str,
+    cursor_bin: str,
+    cursor_model: str = "",
+) -> tuple[list[str], str]:
     """
     Returns (cmd, effective_prompt) for a single attempt.
     Always uses `/plan` embedded in the prompt (this Cursor CLI does not support `--mode`).
     """
-    return [cursor_bin], "/plan\n\n" + prompt
+    cmd = [cursor_bin]
+    model = (cursor_model or "").strip()
+    if model:
+        cmd.extend(["--model", model])
+    return cmd, "/plan\n\n" + prompt
 
 
 def _wrap_prompt_for_headless_clarifications(prompt: str) -> str:
@@ -74,6 +83,7 @@ def _run_cursor_agent_with_pty_capture(
     cursor_log_file: Optional[str],
     heartbeat_seconds: int,
     cursor_bin: str,
+    cursor_model: str = "",
 ) -> tuple[str, int]:
     """
     Runs cursor-agent connected to a PTY, forwarding stdin/stdout and capturing output.
@@ -81,7 +91,11 @@ def _run_cursor_agent_with_pty_capture(
     """
     import pty
 
-    cmd, effective_prompt = _prepare_cursor_invocation(prompt=prompt, cursor_bin=cursor_bin)
+    cmd, effective_prompt = _prepare_cursor_invocation(
+        prompt=prompt,
+        cursor_bin=cursor_bin,
+        cursor_model=cursor_model,
+    )
 
     pid, master_fd = pty.fork()
     if pid == 0:
@@ -380,12 +394,17 @@ def run_cursor_agent_capture_output(
     timeout_seconds: int,
     retries: int = 0,
     cursor_bin: str = "cursor-agent",
+    cursor_model: str = "",
 ) -> str:
     """
     Non-interactive capture.
     If Cursor needs interactive clarifications, prefer the interactive runner.
     """
-    cmd, effective_prompt = _prepare_cursor_invocation(prompt=prompt, cursor_bin=cursor_bin)
+    cmd, effective_prompt = _prepare_cursor_invocation(
+        prompt=prompt,
+        cursor_bin=cursor_bin,
+        cursor_model=cursor_model,
+    )
     # #region agent log (debug ndjson)
     _debug_log(
         "H10",
@@ -571,6 +590,7 @@ def run_cursor_for_runner_output(
     timeout_seconds: int,
     retries: int,
     cursor_bin: str,
+    cursor_model: str = "",
 ) -> tuple[RunnerOutput, str]:
     """
     Runs cursor-agent (interactive PTY or headless) and returns (RunnerOutput, raw_output_used).
@@ -585,6 +605,7 @@ def run_cursor_for_runner_output(
             cursor_log_file=cursor_log_file,
             heartbeat_seconds=heartbeat_seconds,
             cursor_bin=cursor_bin,
+            cursor_model=cursor_model,
         )
         if returncode != 0:
             raise RuntimeError("cursor-agent failed (see output above).")
@@ -598,6 +619,7 @@ def run_cursor_for_runner_output(
             timeout_seconds=timeout_seconds,
             retries=retries,
             cursor_bin=cursor_bin,
+            cursor_model=cursor_model,
         )
 
     questions = _extract_clarification_questions(output)
@@ -655,6 +677,7 @@ def run_cursor_for_runner_output(
             timeout_seconds=timeout_seconds,
             retries=retries,
             cursor_bin=cursor_bin,
+            cursor_model=cursor_model,
         )
 
     try:

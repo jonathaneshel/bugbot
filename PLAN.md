@@ -14,6 +14,6 @@ we will use test driven development:
 9. do so until the spec passes, if you feel you're stuck in a loop - write STUCK and specify the reason 
 10. tell me which relevant specs i should run to see you didnt break anything 
 11. after implementing the fix, review yourself using the instructions from instructions file 
-12. then run rubocop checks - if the changes we introduced caused offenses, fix only those offenses 
+12. then run rubocop checks ONLY ON THE CHANGED FILES - if the changes we introduced caused offenses, fix only those offenses 
 13. run brakeman on the diff (compare to base branch) - if we introduced any new warnings, fix only those warnings
     

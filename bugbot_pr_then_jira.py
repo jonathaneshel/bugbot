@@ -41,6 +41,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Run ticket_runner in interactive mode (default is headless).",
     )
     parser.add_argument(
+        "--cursor-model",
+        default=os.environ.get("CURSOR_MODEL", "").strip(),
+        help="cursor-agent model to use (defaults to env CURSOR_MODEL; empty = cursor-agent default).",
+    )
+    parser.add_argument(
+        "--cursor-timeout-seconds",
+        type=int,
+        default=int(os.environ.get("CURSOR_TIMEOUT_SECONDS", "600")),
+        help="Timeout for cursor-agent (seconds). Defaults to env CURSOR_TIMEOUT_SECONDS or 600.",
+    )
+    parser.add_argument(
         "--redo-pr",
         action="store_true",
         help="Redo an existing PR: forwards --redo-pr to ticket_runner (skips karamba new/pr; commits + force-pushes current branch).",
@@ -68,9 +79,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         runner_cmd.append("--non-interactive")
     if args.redo_pr:
         runner_cmd.append("--redo-pr")
+    if str(args.cursor_model or "").strip():
+        runner_cmd.extend(["--cursor-model", str(args.cursor_model).strip()])
+    if int(args.cursor_timeout_seconds or 0) > 0:
+        runner_cmd.extend(["--cursor-timeout-seconds", str(int(args.cursor_timeout_seconds))])
     if str(args.runner_output_json or "").strip():
         runner_cmd.extend(["--runner-output-json", args.runner_output_json])
-    subprocess.run(runner_cmd, check=True)
+    runner_res = subprocess.run(runner_cmd, check=False)
+    if runner_res.returncode != 0:
+        print(
+            f"[bugbot_pr_then_jira] PR flow failed (exit {runner_res.returncode}); skipping Jira normalization.",
+            file=sys.stderr,
+        )
+        return int(runner_res.returncode)
 
     print(f"[bugbot_pr_then_jira] Normalizing Jira state for {issue_key}...")
     jira_cmd = [sys.executable, JIRA_UPDATER, issue_key]

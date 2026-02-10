@@ -142,6 +142,56 @@ def ensure_clean_tracked_state(*, repo_dir: str, context: str) -> None:
     raise RuntimeError(f"{msg}\n\ngit status --porcelain:\n{out.strip()}\n")
 
 
+def _git_has_any_changes_including_untracked(repo_dir: str) -> bool:
+    out = _git_status_porcelain(repo_dir)
+    for entry in out.split("\0"):
+        if entry:
+            return True
+    return False
+
+
+def stash_all_changes(*, repo_dir: str, message: str) -> Optional[str]:
+    _ensure_git_repo(repo_dir)
+    if not _git_has_any_changes_including_untracked(repo_dir):
+        return None
+    res_push = _run_cmd(
+        cmd=["git", "stash", "push", "-u", "-m", (message or "").strip() or "bugbot-auto-stash"],
+        cwd=repo_dir,
+        check=False,
+        capture_output=True,
+    )
+    if res_push.returncode != 0:
+        out = ((res_push.stdout or "") + "\n" + (res_push.stderr or "")).strip()
+        raise RuntimeError(f"git stash push failed.\n{out}")
+    res = _run_cmd(
+        cmd=["git", "stash", "list"],
+        cwd=repo_dir,
+        check=False,
+        capture_output=True,
+    )
+    msg = (message or "").strip()
+    if msg and (res.stdout or ""):
+        for line in (res.stdout or "").splitlines():
+            if msg in line:
+                m = re.match(r"^(stash@\{\d+\}):", line.strip())
+                if m:
+                    return m.group(1)
+    return "stash@{0}"
+
+
+def pop_stash_best_effort(*, repo_dir: str, stash_ref: str) -> bool:
+    ref = (stash_ref or "").strip()
+    if not ref:
+        return False
+    res = _run_cmd(
+        cmd=["git", "stash", "pop", ref],
+        cwd=repo_dir,
+        check=False,
+        capture_output=True,
+    )
+    return res.returncode == 0
+
+
 def fetch_and_checkout_branch(
     *,
     repo_dir: str,
