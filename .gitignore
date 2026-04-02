@@ -19,4 +19,12 @@ logs/
 .env
 .env.*
 
+# Local bot state / generated artifacts
+.slackbot_sessions.json
+.gitbot_state.sqlite3
+review_context/
+
+# Secrets
+*.pem
+
 
